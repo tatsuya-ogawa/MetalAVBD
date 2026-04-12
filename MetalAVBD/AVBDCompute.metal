@@ -1,0 +1,2407 @@
+//
+//  AVBDCompute.metal
+//  MetalAVBD
+//
+//  Compute shader kernels for AVBD rigid body solver.
+//  Ported from the CPU AVBDSolver (Gauss-Seidel → Jacobi-parallel).
+//
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#import "AVBDComputeTypes.h"
+#import "ShaderTypes.h"
+
+using namespace metal;
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+
+// Quaternion multiply: q * r
+static float4 quat_mul(float4 q, float4 r) {
+    return float4(
+        q.w * r.x + q.x * r.w + q.y * r.z - q.z * r.y,
+        q.w * r.y - q.x * r.z + q.y * r.w + q.z * r.x,
+        q.w * r.z + q.x * r.y - q.y * r.x + q.z * r.w,
+        q.w * r.w - q.x * r.x - q.y * r.y - q.z * r.z
+    );
+}
+
+// Quaternion conjugate
+static float4 quat_conj(float4 q) {
+    return float4(-q.x, -q.y, -q.z, q.w);
+}
+
+// Rotate vector by quaternion
+static float3 quat_act(float4 q, float3 v) {
+    float3 t = 2.0f * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+// Rotation difference as scaled axis: 2 * imag(a * inv(b))
+static float3 quat_delta(float4 a, float4 b) {
+    float4 d = quat_mul(a, quat_conj(b));
+    return d.xyz * 2.0f;
+}
+
+// q + angular velocity * dt
+static float4 quat_add_angular(float4 q, float3 v) {
+    float4 dq = float4(v.x, v.y, v.z, 0.0f);
+    float4 result = q + quat_mul(dq, q) * 0.5f;
+    return normalize(result);
+}
+
+// Transform local point to world
+static float3 xform(float3 pos, float4 quat, float3 local) {
+    return quat_act(quat, local) + pos;
+}
+
+// 3x3 matrix operations (stored as 3 row float3s)
+struct Mat3 {
+    float3 r0, r1, r2;
+
+    Mat3() : r0(0), r1(0), r2(0) {}
+    Mat3(float3 r0, float3 r1, float3 r2) : r0(r0), r1(r1), r2(r2) {}
+
+    static Mat3 identity() {
+        return Mat3(float3(1,0,0), float3(0,1,0), float3(0,0,1));
+    }
+
+    static Mat3 diag(float a, float b, float c) {
+        return Mat3(float3(a,0,0), float3(0,b,0), float3(0,0,c));
+    }
+
+    static Mat3 diag3(float3 v) {
+        return diag(v.x, v.y, v.z);
+    }
+
+    float3 col(int c) const {
+        return float3(r0[c], r1[c], r2[c]);
+    }
+
+    float3 mul(float3 v) const {
+        return float3(dot(r0, v), dot(r1, v), dot(r2, v));
+    }
+
+    Mat3 operator+(Mat3 b) const { return Mat3(r0 + b.r0, r1 + b.r1, r2 + b.r2); }
+    Mat3 operator-(Mat3 b) const { return Mat3(r0 - b.r0, r1 - b.r1, r2 - b.r2); }
+    Mat3 operator*(float s) const { return Mat3(r0 * s, r1 * s, r2 * s); }
+    Mat3 operator/(float s) const { return Mat3(r0 / s, r1 / s, r2 / s); }
+};
+
+static Mat3 mat3_mul(Mat3 a, Mat3 b) {
+    return Mat3(
+        float3(dot(a.r0, b.col(0)), dot(a.r0, b.col(1)), dot(a.r0, b.col(2))),
+        float3(dot(a.r1, b.col(0)), dot(a.r1, b.col(1)), dot(a.r1, b.col(2))),
+        float3(dot(a.r2, b.col(0)), dot(a.r2, b.col(1)), dot(a.r2, b.col(2)))
+    );
+}
+
+static Mat3 mat3_transpose(Mat3 m) {
+    return Mat3(m.col(0), m.col(1), m.col(2));
+}
+
+static Mat3 skew(float3 r) {
+    return Mat3(
+        float3(0, -r.z, r.y),
+        float3(r.z, 0, -r.x),
+        float3(-r.y, r.x, 0)
+    );
+}
+
+static Mat3 outer(float3 a, float3 b) {
+    return Mat3(b * a.x, b * a.y, b * a.z);
+}
+
+static Mat3 diagonalize_mat(Mat3 m) {
+    return Mat3::diag(length(m.col(0)), length(m.col(1)), length(m.col(2)));
+}
+
+static float sign_f(float x) {
+    return x < 0 ? -1.0f : (x > 0 ? 1.0f : 0.0f);
+}
+
+static float3 clamp_vec(float3 v, float lo, float hi) {
+    return float3(clamp(v.x, lo, hi), clamp(v.y, lo, hi), clamp(v.z, lo, hi));
+}
+
+static float3 min_vec(float3 v, float s) {
+    return float3(min(v.x, s), min(v.y, s), min(v.z, s));
+}
+
+static float3 abs_vec(float3 v) {
+    return float3(abs(v.x), abs(v.y), abs(v.z));
+}
+
+constant int AVBD_GPU_AXIS_FACE_A = AVBDAxisTypeFaceA;
+constant int AVBD_GPU_AXIS_FACE_B = AVBDAxisTypeFaceB;
+constant int AVBD_GPU_AXIS_EDGE = AVBDAxisTypeEdge;
+constant int AVBD_GPU_RENDER_SHAPE_BOX = AVBDRenderShapeBox;
+constant int AVBD_GPU_RENDER_SHAPE_SPHERE = AVBDRenderShapeSphere;
+constant int AVBD_GPU_RENDER_SHAPE_TORUS = AVBDRenderShapeTorus;
+constant int AVBD_GPU_FEATURE_SPHERE_SPHERE = AVBDCollisionFeaturePrefixSphereSphere;
+constant int AVBD_GPU_FEATURE_SPHERE_BOX = AVBDCollisionFeaturePrefixSphereBox;
+constant int AVBD_GPU_FEATURE_TORUS_SPHERE = AVBDCollisionFeaturePrefixTorusSphere;
+constant int AVBD_GPU_FEATURE_TORUS_BOX = AVBDCollisionFeaturePrefixTorusBox;
+constant int AVBD_GPU_FEATURE_TORUS_TORUS = AVBDCollisionFeaturePrefixTorusTorus;
+constant int AVBD_GPU_MAX_POLY_VERTS = AVBD_COLLISION_MAX_POLY_VERTS;
+constant int AVBD_GPU_TORUS_APPROX_SPHERE_COUNT_MAX = AVBD_TORUS_APPROX_SPHERE_COUNT_MAX;
+constant int AVBD_GPU_TORUS_APPROX_SPHERE_COUNT_DEFAULT = AVBD_TORUS_APPROX_SPHERE_COUNT_DEFAULT;
+constant float AVBD_GPU_TORUS_APPROX_SPHERE_RADIUS_SCALE_DEFAULT = AVBD_TORUS_APPROX_SPHERE_RADIUS_SCALE_DEFAULT;
+constant float AVBD_GPU_SAT_AXIS_EPSILON = AVBD_COLLISION_SAT_AXIS_EPSILON;
+constant float AVBD_GPU_PLANE_EPSILON = AVBD_COLLISION_PLANE_EPSILON;
+constant float AVBD_GPU_CONTACT_MERGE_DIST_SQ = AVBD_COLLISION_CONTACT_MERGE_DIST_SQ;
+constant float AVBD_GPU_CONTACT_PENALTY_START = AVBD_COLLISION_CONTACT_PENALTY_START;
+
+struct AVBDGPUOBBMetal {
+    float3 center;
+    float4 rotation;
+    float3 halfSize;
+    float3 axis[3];
+};
+
+struct AVBDGPUSatAxisMetal {
+    int type;
+    int indexA;
+    int indexB;
+    float separation;
+    float3 normalAB;
+    bool valid;
+};
+
+struct AVBDGPUFaceFrameMetal {
+    float3 normal;
+    float3 center;
+    float3 u;
+    float3 v;
+    float extentU;
+    float extentV;
+};
+
+struct AVBDGPUContactBuilderMetal {
+    AVBDGPUContact contacts[AVBD_MAX_CONTACTS_PER_PAIR_BURST];
+    float3 midpoints[AVBD_MAX_CONTACTS_PER_PAIR_BURST];
+    int count;
+};
+
+static int torus_approx_sphere_count(constant AVBDGPUSolverParams &params);
+static float torus_outer_radius(device const AVBDGPUBody &body);
+static float torus_minor_radius(device const AVBDGPUBody &body);
+static float torus_approx_sphere_radius(device const AVBDGPUBody &body, constant AVBDGPUSolverParams &params);
+static float torus_major_radius(device const AVBDGPUBody &body);
+
+// Derive (bodyA, bodyB) from an upper-triangle pair index.
+// For n bodies, pairs (i,j) with i<j are enumerated row-major:
+//   tid 0 → (0,1), 1 → (0,2), ..., n-2 → (0,n-1), n-1 → (1,2), ...
+static void upper_triangle_pair(uint tid, int n, thread int &outA, thread int &outB) {
+    if (n < 2) {
+        outA = -1;
+        outB = -1;
+        return;
+    }
+
+    float fn = float(n);
+    float fk = float(tid);
+    int i = int(floor((2.0f * fn - 1.0f - sqrt((2.0f * fn - 1.0f) * (2.0f * fn - 1.0f) - 8.0f * fk)) * 0.5f));
+    // Clamp to valid range (floating-point rounding protection)
+    i = clamp(i, 0, n - 2);
+    int rowStart = i * (2 * n - i - 1) / 2;
+    // If we overshot due to rounding, step back until the row covers tid.
+    while (i > 0 && rowStart > int(tid)) {
+        i--;
+        rowStart = i * (2 * n - i - 1) / 2;
+    }
+    // If sqrt rounding kept us on the previous row at an exact row boundary, step forward.
+    while (i < n - 2) {
+        int nextRow = i + 1;
+        int nextRowStart = nextRow * (2 * n - nextRow - 1) / 2;
+        if (nextRowStart > int(tid)) {
+            break;
+        }
+        i = nextRow;
+        rowStart = nextRowStart;
+    }
+    int j = int(tid) - rowStart + i + 1;
+    outA = i;
+    outB = j;
+}
+
+// Reserve a single manifold slot from the manifold allocator. Returns -1 if full.
+static int reserve_manifold_slot(device AVBDGPUManifoldAllocator &allocator) {
+    int expected = atomic_load_explicit(&allocator.nextManifoldIndex, memory_order_relaxed);
+    while (true) {
+        if (expected >= allocator.manifoldCapacity) return -1;
+        if (atomic_compare_exchange_weak_explicit(&allocator.nextManifoldIndex,
+                                                  &expected,
+                                                  expected + 1,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            return expected;
+        }
+    }
+}
+
+// Reserve a contiguous range of manifold slots. Returns number granted.
+static int reserve_manifold_range(device AVBDGPUManifoldAllocator &allocator, int requestedCount, thread int &baseIndex) {
+    int expected = atomic_load_explicit(&allocator.nextManifoldIndex, memory_order_relaxed);
+    while (true) {
+        int remaining = allocator.manifoldCapacity - expected;
+        if (remaining <= 0) return 0;
+        int grantedCount = min(requestedCount, remaining);
+        int desired = expected + grantedCount;
+        if (atomic_compare_exchange_weak_explicit(&allocator.nextManifoldIndex,
+                                                  &expected,
+                                                  desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            baseIndex = expected;
+            return grantedCount;
+        }
+    }
+}
+
+// Check if bodyB is in bodyA's collision exclusion list.
+static bool is_excluded(device AVBDGPUCollisionExclusion *exclusions, int bodyA, int bodyB) {
+    int countA = atomic_load_explicit(&exclusions[bodyA].excludeCount, memory_order_relaxed);
+    for (int i = 0; i < countA; i++) {
+        if (exclusions[bodyA].excludeIndices[i] == bodyB) return true;
+    }
+    return false;
+}
+
+static int reserve_contact_range(device AVBDGPUContactAllocator &allocator, int requestedCount, thread int &baseIndex) {
+    int expected = atomic_load_explicit(&allocator.nextContactIndex, memory_order_relaxed);
+    while (true) {
+        int remaining = allocator.contactCapacity - expected;
+        if (remaining <= 0) {
+            return 0;
+        }
+
+        int grantedCount = min(requestedCount, remaining);
+        int desired = expected + grantedCount;
+        if (atomic_compare_exchange_weak_explicit(&allocator.nextContactIndex,
+                                                  &expected,
+                                                  desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            baseIndex = expected;
+            return grantedCount;
+        }
+    }
+}
+
+static int reserve_recent_pair_range(device AVBDGPURecentPairCacheState &state, int requestedCount, thread int &baseIndex) {
+    int expected = atomic_load_explicit(&state.count, memory_order_relaxed);
+    while (true) {
+        int remaining = state.capacity - expected;
+        if (remaining <= 0) {
+            return 0;
+        }
+
+        int grantedCount = min(requestedCount, remaining);
+        int desired = expected + grantedCount;
+        if (atomic_compare_exchange_weak_explicit(&state.count,
+                                                  &expected,
+                                                  desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            baseIndex = expected;
+            return grantedCount;
+        }
+    }
+}
+
+static int reserve_active_manifold_range(device AVBDGPUActiveManifoldListState &state, int requestedCount, thread int &baseIndex) {
+    int expected = atomic_load_explicit(&state.count, memory_order_relaxed);
+    while (true) {
+        int remaining = state.capacity - expected;
+        if (remaining <= 0) {
+            return 0;
+        }
+
+        int grantedCount = min(requestedCount, remaining);
+        int desired = expected + grantedCount;
+        if (atomic_compare_exchange_weak_explicit(&state.count,
+                                                  &expected,
+                                                  desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            baseIndex = expected;
+            return grantedCount;
+        }
+    }
+}
+
+static float abs_dot(float3 a, float3 b) {
+    return abs(dot(a, b));
+}
+
+static Mat3 orthonormal_basis(float3 normal) {
+    float3 t1 = abs(normal.x) > abs(normal.z)
+        ? float3(-normal.y, normal.x, 0.0f)
+        : float3(0.0f, -normal.z, normal.y);
+    float len = length(t1);
+    t1 = len > 1.0e-8f ? t1 / len : float3(1, 0, 0);
+    float3 t2 = cross(normal, t1);
+    return Mat3(normal, t1, t2);
+}
+
+static void make_obb(device const AVBDGPUBody &body, thread AVBDGPUOBBMetal &box) {
+    box.center = body.positionLin;
+    box.rotation = normalize(body.positionAng);
+    box.halfSize = body.size * 0.5f;
+    box.axis[0] = quat_act(box.rotation, float3(1, 0, 0));
+    box.axis[1] = quat_act(box.rotation, float3(0, 1, 0));
+    box.axis[2] = quat_act(box.rotation, float3(0, 0, 1));
+}
+
+static int torus_approx_sphere_count(constant AVBDGPUSolverParams &params) {
+    int requestedCount = params.torusApproxSphereCount > 0 ? params.torusApproxSphereCount : AVBD_GPU_TORUS_APPROX_SPHERE_COUNT_DEFAULT;
+    return clamp(requestedCount, 4, AVBD_GPU_TORUS_APPROX_SPHERE_COUNT_MAX);
+}
+
+static float body_radius(device const AVBDGPUBody &body, constant AVBDGPUSolverParams &params) {
+    if (body.renderShape == AVBD_GPU_RENDER_SHAPE_SPHERE) {
+        return max(body.size.x, max(body.size.y, body.size.z)) * 0.5f;
+    }
+    if (body.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS) {
+        return torus_major_radius(body) + torus_approx_sphere_radius(body, params);
+    }
+    return length(body.size * 0.5f);
+}
+
+static float torus_outer_radius(device const AVBDGPUBody &body) {
+    float outerDiameter = max(min(body.size.x, body.size.y), 0.0f);
+    return outerDiameter * 0.5f;
+}
+
+static float torus_minor_radius(device const AVBDGPUBody &body) {
+    float outerDiameter = torus_outer_radius(body) * 2.0f;
+    float tubeDiameter = max(min(body.size.z, outerDiameter), 0.0f);
+    return tubeDiameter * 0.5f;
+}
+
+static float torus_approx_sphere_radius(device const AVBDGPUBody &body, constant AVBDGPUSolverParams &params) {
+    float scale = params.torusApproxSphereRadiusScale > 0.0f ? params.torusApproxSphereRadiusScale : AVBD_GPU_TORUS_APPROX_SPHERE_RADIUS_SCALE_DEFAULT;
+    return torus_minor_radius(body) * scale;
+}
+
+static float torus_major_radius(device const AVBDGPUBody &body) {
+    return max(torus_outer_radius(body) - torus_minor_radius(body), 0.0f);
+}
+
+static float3 torus_sphere_local_center(device const AVBDGPUBody &body, int index, constant AVBDGPUSolverParams &params) {
+    float angle = (2.0f * M_PI_F * float(index)) / float(torus_approx_sphere_count(params));
+    float majorRadius = torus_major_radius(body);
+    return float3(cos(angle) * majorRadius, sin(angle) * majorRadius, 0.0f);
+}
+
+static float3 torus_sphere_world_center(device const AVBDGPUBody &body, int index, constant AVBDGPUSolverParams &params) {
+    return quat_act(body.positionAng, torus_sphere_local_center(body, index, params)) + body.positionLin;
+}
+
+static bool test_axis(thread const AVBDGPUOBBMetal &boxA,
+                      thread const AVBDGPUOBBMetal &boxB,
+                      float3 delta,
+                      float3 axis,
+                      int type,
+                      int indexA,
+                      int indexB,
+                      thread AVBDGPUSatAxisMetal &best)
+{
+    float lenSq = length_squared(axis);
+    if (lenSq < AVBD_GPU_SAT_AXIS_EPSILON) {
+        return true;
+    }
+
+    float3 n = axis / sqrt(lenSq);
+    if (dot(n, delta) < 0.0f) {
+        n = -n;
+    }
+
+    float distance = abs(dot(delta, n));
+    float rA = boxA.halfSize.x * abs_dot(n, boxA.axis[0])
+        + boxA.halfSize.y * abs_dot(n, boxA.axis[1])
+        + boxA.halfSize.z * abs_dot(n, boxA.axis[2]);
+    float rB = boxB.halfSize.x * abs_dot(n, boxB.axis[0])
+        + boxB.halfSize.y * abs_dot(n, boxB.axis[1])
+        + boxB.halfSize.z * abs_dot(n, boxB.axis[2]);
+
+    float separation = distance - (rA + rB);
+    if (separation > 0.0f) {
+        return false;
+    }
+
+    if (!best.valid || separation > best.separation) {
+        best.valid = true;
+        best.type = type;
+        best.indexA = indexA;
+        best.indexB = indexB;
+        best.separation = separation;
+        best.normalAB = n;
+    }
+
+    return true;
+}
+
+static float3 support_point(thread const AVBDGPUOBBMetal &box, float3 dir) {
+    float sx = dot(dir, box.axis[0]) >= 0.0f ? 1.0f : -1.0f;
+    float sy = dot(dir, box.axis[1]) >= 0.0f ? 1.0f : -1.0f;
+    float sz = dot(dir, box.axis[2]) >= 0.0f ? 1.0f : -1.0f;
+
+    return box.center
+        + box.axis[0] * (box.halfSize.x * sx)
+        + box.axis[1] * (box.halfSize.y * sy)
+        + box.axis[2] * (box.halfSize.z * sz);
+}
+
+static void get_face_axes(thread const AVBDGPUOBBMetal &box,
+                          int axisIndex,
+                          thread float3 &u,
+                          thread float3 &v,
+                          thread float &extentU,
+                          thread float &extentV)
+{
+    if (axisIndex == 0) {
+        u = box.axis[1];
+        v = box.axis[2];
+        extentU = box.halfSize.y;
+        extentV = box.halfSize.z;
+    } else if (axisIndex == 1) {
+        u = box.axis[0];
+        v = box.axis[2];
+        extentU = box.halfSize.x;
+        extentV = box.halfSize.z;
+    } else {
+        u = box.axis[0];
+        v = box.axis[1];
+        extentU = box.halfSize.x;
+        extentV = box.halfSize.y;
+    }
+}
+
+static AVBDGPUFaceFrameMetal build_face_frame(thread const AVBDGPUOBBMetal &box, int axisIndex, float3 outwardNormal) {
+    float faceSign = dot(outwardNormal, box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
+    AVBDGPUFaceFrameMetal frame;
+    frame.normal = box.axis[axisIndex] * faceSign;
+    get_face_axes(box, axisIndex, frame.u, frame.v, frame.extentU, frame.extentV);
+    frame.center = box.center + frame.normal * box.halfSize[axisIndex];
+    return frame;
+}
+
+static int choose_incident_face_axis(thread const AVBDGPUOBBMetal &box, float3 referenceNormal) {
+    int axis = 0;
+    float best = -FLT_MAX;
+    for (int i = 0; i < 3; i++) {
+        float d = abs_dot(box.axis[i], referenceNormal);
+        if (d > best) {
+            best = d;
+            axis = i;
+        }
+    }
+    return axis;
+}
+
+static void build_incident_face(thread const AVBDGPUOBBMetal &box,
+                                int axisIndex,
+                                float3 referenceNormal,
+                                thread float3 verts[AVBD_GPU_MAX_POLY_VERTS],
+                                thread int &count)
+{
+    float faceSign = dot(box.axis[axisIndex], referenceNormal) > 0.0f ? -1.0f : 1.0f;
+    float3 faceNormal = box.axis[axisIndex] * faceSign;
+    float3 faceCenter = box.center + faceNormal * box.halfSize[axisIndex];
+    float3 u, v;
+    float extentU, extentV;
+    get_face_axes(box, axisIndex, u, v, extentU, extentV);
+
+    verts[0] = faceCenter + u * extentU + v * extentV;
+    verts[1] = faceCenter - u * extentU + v * extentV;
+    verts[2] = faceCenter - u * extentU - v * extentV;
+    verts[3] = faceCenter + u * extentU - v * extentV;
+    count = 4;
+}
+
+static int clip_polygon_against_plane(thread const float3 inVerts[AVBD_GPU_MAX_POLY_VERTS],
+                                      int inCount,
+                                      float3 planeNormal,
+                                      float planeOffset,
+                                      thread float3 outVerts[AVBD_GPU_MAX_POLY_VERTS])
+{
+    if (inCount <= 0) {
+        return 0;
+    }
+
+    int outCount = 0;
+    float3 a = inVerts[inCount - 1];
+    float da = dot(planeNormal, a) - planeOffset;
+
+    for (int i = 0; i < inCount; i++) {
+        float3 b = inVerts[i];
+        float db = dot(planeNormal, b) - planeOffset;
+        bool aInside = da <= AVBD_GPU_PLANE_EPSILON;
+        bool bInside = db <= AVBD_GPU_PLANE_EPSILON;
+
+        if (aInside != bInside) {
+            float t = 0.0f;
+            float denom = da - db;
+            if (abs(denom) > AVBD_GPU_SAT_AXIS_EPSILON) {
+                t = clamp(da / denom, 0.0f, 1.0f);
+            }
+            if (outCount < AVBD_GPU_MAX_POLY_VERTS) {
+                outVerts[outCount++] = a + (b - a) * t;
+            }
+        }
+
+        if (bInside && outCount < AVBD_GPU_MAX_POLY_VERTS) {
+            outVerts[outCount++] = b;
+        }
+
+        a = b;
+        da = db;
+    }
+
+    return outCount;
+}
+
+static AVBDGPUContact make_contact(device const AVBDGPUBody &bodyA,
+                                   device const AVBDGPUBody &bodyB,
+                                   float3 xA,
+                                   float3 xB,
+                                   int featureKey)
+{
+    AVBDGPUContact contact;
+    contact.rA = quat_act(quat_conj(bodyA.positionAng), xA - bodyA.positionLin);
+    contact.rB = quat_act(quat_conj(bodyB.positionAng), xB - bodyB.positionLin);
+    contact.C0 = float3(0);
+    contact.penalty = float3(0);
+    contact.lambda = float3(0);
+    contact.featureKey = featureKey;
+    contact.active = 0;
+    contact.stick = 0;
+    return contact;
+}
+
+static void append_contact(thread AVBDGPUContactBuilderMetal &builder,
+                           device const AVBDGPUBody &bodyA,
+                           device const AVBDGPUBody &bodyB,
+                           float3 xA,
+                           float3 xB,
+                           int featureKey)
+{
+    float3 midpoint = (xA + xB) * 0.5f;
+    for (int i = 0; i < builder.count; i++) {
+        if (length_squared(midpoint - builder.midpoints[i]) < AVBD_GPU_CONTACT_MERGE_DIST_SQ) {
+            return;
+        }
+    }
+    if (builder.count >= AVBD_MAX_CONTACTS_PER_PAIR_BURST) {
+        return;
+    }
+    builder.contacts[builder.count] = make_contact(bodyA, bodyB, xA, xB, featureKey);
+    builder.midpoints[builder.count] = midpoint;
+    builder.count++;
+}
+
+static void finalize_builder_contacts(device const AVBDGPUBody &bodyA,
+                                      device const AVBDGPUBody &bodyB,
+                                      thread AVBDGPUContactBuilderMetal &builder,
+                                      thread Mat3 &basis,
+                                      float collisionMargin)
+{
+    for (int i = 0; i < builder.count; i++) {
+        float3 xA = quat_act(bodyA.positionAng, builder.contacts[i].rA) + bodyA.positionLin;
+        float3 xB = quat_act(bodyB.positionAng, builder.contacts[i].rB) + bodyB.positionLin;
+        float3 diff = xA - xB;
+        builder.contacts[i].C0 = float3(dot(basis.r0, diff), dot(basis.r1, diff), dot(basis.r2, diff)) + float3(collisionMargin, 0, 0);
+        builder.contacts[i].penalty = float3(AVBD_GPU_CONTACT_PENALTY_START);
+        builder.contacts[i].active = 1;
+    }
+}
+
+static void support_edge(thread const AVBDGPUOBBMetal &box,
+                         int axisIndex,
+                         float3 dir,
+                         thread float3 &edgeA,
+                         thread float3 &edgeB)
+{
+    int axis1 = (axisIndex + 1) % 3;
+    int axis2 = (axisIndex + 2) % 3;
+    float sign1 = dot(dir, box.axis[axis1]) >= 0.0f ? 1.0f : -1.0f;
+    float sign2 = dot(dir, box.axis[axis2]) >= 0.0f ? 1.0f : -1.0f;
+    float3 edgeCenter = box.center
+        + box.axis[axis1] * (box.halfSize[axis1] * sign1)
+        + box.axis[axis2] * (box.halfSize[axis2] * sign2);
+    edgeA = edgeCenter - box.axis[axisIndex] * box.halfSize[axisIndex];
+    edgeB = edgeCenter + box.axis[axisIndex] * box.halfSize[axisIndex];
+}
+
+static void closest_points_on_segments(float3 p0,
+                                       float3 p1,
+                                       float3 q0,
+                                       float3 q1,
+                                       thread float3 &outA,
+                                       thread float3 &outB)
+{
+    float3 d1 = p1 - p0;
+    float3 d2 = q1 - q0;
+    float3 r = p0 - q0;
+    float a = dot(d1, d1);
+    float e = dot(d2, d2);
+    float f = dot(d2, r);
+    float s = 0.0f;
+    float t = 0.0f;
+
+    if (a <= AVBD_GPU_SAT_AXIS_EPSILON && e <= AVBD_GPU_SAT_AXIS_EPSILON) {
+        outA = p0;
+        outB = q0;
+        return;
+    }
+
+    if (a <= AVBD_GPU_SAT_AXIS_EPSILON) {
+        t = clamp(f / e, 0.0f, 1.0f);
+    } else {
+        float c = dot(d1, r);
+        if (e <= AVBD_GPU_SAT_AXIS_EPSILON) {
+            s = clamp(-c / a, 0.0f, 1.0f);
+        } else {
+            float b = dot(d1, d2);
+            float denom = a * e - b * b;
+            if (abs(denom) > AVBD_GPU_SAT_AXIS_EPSILON) {
+                s = clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+            }
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = clamp(-c / a, 0.0f, 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = clamp((b - c) / a, 0.0f, 1.0f);
+            }
+        }
+    }
+
+    outA = p0 + d1 * s;
+    outB = q0 + d2 * t;
+}
+
+static void build_face_manifold(device const AVBDGPUBody &bodyA,
+                                device const AVBDGPUBody &bodyB,
+                                thread const AVBDGPUOBBMetal &boxA,
+                                thread const AVBDGPUOBBMetal &boxB,
+                                bool referenceIsA,
+                                int referenceAxis,
+                                float3 normalAB,
+                                thread AVBDGPUContactBuilderMetal &builder)
+{
+    thread const AVBDGPUOBBMetal &referenceBox = referenceIsA ? boxA : boxB;
+    thread const AVBDGPUOBBMetal &incidentBox = referenceIsA ? boxB : boxA;
+    float3 referenceOutward = referenceIsA ? normalAB : -normalAB;
+    AVBDGPUFaceFrameMetal referenceFace = build_face_frame(referenceBox, referenceAxis, referenceOutward);
+    int incidentAxis = choose_incident_face_axis(incidentBox, referenceFace.normal);
+
+    float3 polyA[AVBD_GPU_MAX_POLY_VERTS];
+    float3 polyB[AVBD_GPU_MAX_POLY_VERTS];
+    int count = 0;
+    build_incident_face(incidentBox, incidentAxis, referenceFace.normal, polyA, count);
+    count = clip_polygon_against_plane(polyA, count, referenceFace.u, dot(referenceFace.u, referenceFace.center) + referenceFace.extentU, polyB);
+    if (count <= 0) return;
+    count = clip_polygon_against_plane(polyB, count, -referenceFace.u, dot(-referenceFace.u, referenceFace.center) + referenceFace.extentU, polyA);
+    if (count <= 0) return;
+    count = clip_polygon_against_plane(polyA, count, referenceFace.v, dot(referenceFace.v, referenceFace.center) + referenceFace.extentV, polyB);
+    if (count <= 0) return;
+    count = clip_polygon_against_plane(polyB, count, -referenceFace.v, dot(-referenceFace.v, referenceFace.center) + referenceFace.extentV, polyA);
+    if (count <= 0) return;
+
+    int featurePrefix = (referenceIsA ? AVBD_GPU_AXIS_FACE_A : AVBD_GPU_AXIS_FACE_B) << 24;
+    featurePrefix |= (referenceAxis & 0xFF) << 16;
+    featurePrefix |= (incidentAxis & 0xFF) << 8;
+
+    for (int i = 0; i < count && builder.count < AVBD_MAX_CONTACTS_PER_PAIR_BURST; i++) {
+        float3 pIncident = polyA[i];
+        float distance = dot(pIncident - referenceFace.center, referenceFace.normal);
+        if (distance > AVBD_GPU_PLANE_EPSILON) {
+            continue;
+        }
+
+        float3 pReference = pIncident - referenceFace.normal * distance;
+        float3 xA = referenceIsA ? pReference : pIncident;
+        float3 xB = referenceIsA ? pIncident : pReference;
+        append_contact(builder, bodyA, bodyB, xA, xB, featurePrefix | (i & 0xFF));
+    }
+
+    if (builder.count == 0) {
+        append_contact(builder, bodyA, bodyB, support_point(boxA, normalAB), support_point(boxB, -normalAB), featurePrefix);
+    }
+}
+
+static void build_edge_contact(device const AVBDGPUBody &bodyA,
+                               device const AVBDGPUBody &bodyB,
+                               thread const AVBDGPUOBBMetal &boxA,
+                               thread const AVBDGPUOBBMetal &boxB,
+                               int axisA,
+                               int axisB,
+                               float3 normalAB,
+                               thread AVBDGPUContactBuilderMetal &builder)
+{
+    float3 a0, a1, b0, b1;
+    support_edge(boxA, axisA, normalAB, a0, a1);
+    support_edge(boxB, axisB, -normalAB, b0, b1);
+    float3 xA, xB;
+    closest_points_on_segments(a0, a1, b0, b1, xA, xB);
+
+    int featureKey = (AVBD_GPU_AXIS_EDGE << 24) | ((axisA & 0xFF) << 8) | (axisB & 0xFF);
+    append_contact(builder, bodyA, bodyB, xA, xB, featureKey);
+
+    if (builder.count == 0) {
+        append_contact(builder, bodyA, bodyB, support_point(boxA, normalAB), support_point(boxB, -normalAB), featureKey);
+    }
+}
+
+static void closest_point_on_box(thread const AVBDGPUOBBMetal &box,
+                                 float3 point,
+                                 thread float3 &closestPoint,
+                                 thread float3 &normalToBox)
+{
+    float3 localPoint = quat_act(quat_conj(box.rotation), point - box.center);
+    float3 clamped = clamp(localPoint, -box.halfSize, box.halfSize);
+    float3 deltaLocal = clamped - localPoint;
+    float deltaLenSq = length_squared(deltaLocal);
+    if (deltaLenSq > AVBD_GPU_SAT_AXIS_EPSILON) {
+        closestPoint = quat_act(box.rotation, clamped) + box.center;
+        normalToBox = quat_act(box.rotation, deltaLocal / sqrt(deltaLenSq));
+        return;
+    }
+
+    float dx = box.halfSize.x - abs(localPoint.x);
+    float dy = box.halfSize.y - abs(localPoint.y);
+    float dz = box.halfSize.z - abs(localPoint.z);
+    int axis = 0;
+    if (dy < dx && dy <= dz) {
+        axis = 1;
+    } else if (dz < dx && dz < dy) {
+        axis = 2;
+    }
+
+    float3 normalLocal = float3(0.0f);
+    float signToFace = 1.0f;
+    if (axis == 0) {
+        signToFace = localPoint.x >= 0.0f ? 1.0f : -1.0f;
+        clamped.x = box.halfSize.x * signToFace;
+        normalLocal.x = signToFace;
+    } else if (axis == 1) {
+        signToFace = localPoint.y >= 0.0f ? 1.0f : -1.0f;
+        clamped.y = box.halfSize.y * signToFace;
+        normalLocal.y = signToFace;
+    } else {
+        signToFace = localPoint.z >= 0.0f ? 1.0f : -1.0f;
+        clamped.z = box.halfSize.z * signToFace;
+        normalLocal.z = signToFace;
+    }
+
+    closestPoint = quat_act(box.rotation, clamped) + box.center;
+    normalToBox = quat_act(box.rotation, normalLocal);
+}
+
+static bool collide_sphere_sphere_gpu(device const AVBDGPUBody &bodyA,
+                                      device const AVBDGPUBody &bodyB,
+                                      thread AVBDGPUContactBuilderMetal &builder,
+                                      thread Mat3 &basis,
+                                      constant AVBDGPUSolverParams &params,
+                                      float collisionMargin)
+{
+    float radiusA = body_radius(bodyA, params);
+    float radiusB = body_radius(bodyB, params);
+    float3 delta = bodyB.positionLin - bodyA.positionLin;
+    float distSq = length_squared(delta);
+    float radius = radiusA + radiusB;
+    if (distSq > radius * radius) {
+        return false;
+    }
+
+    float3 normalAB = distSq > AVBD_GPU_SAT_AXIS_EPSILON ? delta / sqrt(distSq) : float3(1, 0, 0);
+    basis = orthonormal_basis(-normalAB);
+
+    float3 xA = bodyA.positionLin + normalAB * radiusA;
+    float3 xB = bodyB.positionLin - normalAB * radiusB;
+    append_contact(builder, bodyA, bodyB, xA, xB, AVBD_GPU_FEATURE_SPHERE_SPHERE);
+    finalize_builder_contacts(bodyA, bodyB, builder, basis, collisionMargin);
+
+    return builder.count > 0;
+}
+
+static bool collide_sphere_box_gpu(device const AVBDGPUBody &sphereBody,
+                                   device const AVBDGPUBody &boxBody,
+                                   bool sphereIsBodyA,
+                                   thread AVBDGPUContactBuilderMetal &builder,
+                                   thread Mat3 &basis,
+                                   constant AVBDGPUSolverParams &params,
+                                   float collisionMargin)
+{
+    AVBDGPUOBBMetal box;
+    make_obb(boxBody, box);
+
+    float3 closestPoint;
+    float3 sphereToBoxNormal;
+    closest_point_on_box(box, sphereBody.positionLin, closestPoint, sphereToBoxNormal);
+
+    float sphereRadius = body_radius(sphereBody, params);
+    float3 offset = closestPoint - sphereBody.positionLin;
+    if (length_squared(offset) > sphereRadius * sphereRadius) {
+        return false;
+    }
+
+    float3 normalAB = sphereIsBodyA ? sphereToBoxNormal : -sphereToBoxNormal;
+    basis = orthonormal_basis(-normalAB);
+
+    float3 spherePoint = sphereBody.positionLin + sphereToBoxNormal * sphereRadius;
+    float3 xA = sphereIsBodyA ? spherePoint : closestPoint;
+    float3 xB = sphereIsBodyA ? closestPoint : spherePoint;
+    append_contact(builder,
+                   sphereIsBodyA ? sphereBody : boxBody,
+                   sphereIsBodyA ? boxBody : sphereBody,
+                   xA,
+                   xB,
+                   AVBD_GPU_FEATURE_SPHERE_BOX);
+    finalize_builder_contacts(sphereIsBodyA ? sphereBody : boxBody,
+                              sphereIsBodyA ? boxBody : sphereBody,
+                              builder,
+                              basis,
+                              collisionMargin);
+
+    return builder.count > 0;
+}
+
+static bool sphere_sphere_contact(float3 centerA,
+                                  float radiusA,
+                                  float3 centerB,
+                                  float radiusB,
+                                  thread float3 &normalAB,
+                                  thread float3 &xA,
+                                  thread float3 &xB,
+                                  thread float &penetration)
+{
+    float3 delta = centerB - centerA;
+    float distSq = length_squared(delta);
+    float radius = radiusA + radiusB;
+    if (distSq > radius * radius) {
+        return false;
+    }
+
+    float dist = sqrt(max(distSq, 0.0f));
+    normalAB = dist > AVBD_GPU_SAT_AXIS_EPSILON ? delta / dist : float3(1, 0, 0);
+    xA = centerA + normalAB * radiusA;
+    xB = centerB - normalAB * radiusB;
+    penetration = radius - dist;
+    return true;
+}
+
+static bool sphere_box_contact(float3 sphereCenter,
+                               float sphereRadius,
+                               thread const AVBDGPUOBBMetal &box,
+                               thread float3 &normalFromSphereToBox,
+                               thread float3 &spherePoint,
+                               thread float3 &boxPoint,
+                               thread float &penetration)
+{
+    closest_point_on_box(box, sphereCenter, boxPoint, normalFromSphereToBox);
+    float3 offset = boxPoint - sphereCenter;
+    float distSq = length_squared(offset);
+    if (distSq > sphereRadius * sphereRadius) {
+        return false;
+    }
+
+    spherePoint = sphereCenter + normalFromSphereToBox * sphereRadius;
+    penetration = sphereRadius - sqrt(max(distSq, 0.0f));
+    return true;
+}
+
+static bool collide_torus_body_gpu(device const AVBDGPUBody &torusBody,
+                                   device const AVBDGPUBody &otherBody,
+                                   bool torusIsBodyA,
+                                   thread AVBDGPUContactBuilderMetal &builder,
+                                   thread Mat3 &basis,
+                                   constant AVBDGPUSolverParams &params,
+                                   float collisionMargin)
+{
+    float torusSphereRadius = torus_approx_sphere_radius(torusBody, params);
+    float3 bestNormalAB = float3(1, 0, 0);
+    float bestPenetration = -FLT_MAX;
+    int torusSphereCount = torus_approx_sphere_count(params);
+
+    if (otherBody.renderShape == AVBD_GPU_RENDER_SHAPE_SPHERE) {
+        float otherRadius = body_radius(otherBody, params);
+        for (int torusSphereIndex = 0; torusSphereIndex < torusSphereCount; torusSphereIndex++) {
+            float3 torusSphereCenter = torus_sphere_world_center(torusBody, torusSphereIndex, params);
+            float3 normalFromTorusToOther;
+            float3 xTorus, xOther;
+            float penetration;
+            if (!sphere_sphere_contact(torusSphereCenter, torusSphereRadius, otherBody.positionLin, otherRadius, normalFromTorusToOther, xTorus, xOther, penetration)) {
+                continue;
+            }
+
+            float3 normalAB = torusIsBodyA ? normalFromTorusToOther : -normalFromTorusToOther;
+            if (torusIsBodyA) {
+                append_contact(builder, torusBody, otherBody, xTorus, xOther, AVBD_GPU_FEATURE_TORUS_SPHERE | (torusSphereIndex & 0xFF));
+            } else {
+                append_contact(builder, otherBody, torusBody, xOther, xTorus, AVBD_GPU_FEATURE_TORUS_SPHERE | (torusSphereIndex & 0xFF));
+            }
+
+            if (penetration > bestPenetration) {
+                bestPenetration = penetration;
+                bestNormalAB = normalAB;
+            }
+        }
+    } else if (otherBody.renderShape == AVBD_GPU_RENDER_SHAPE_BOX) {
+        AVBDGPUOBBMetal box;
+        make_obb(otherBody, box);
+
+        for (int torusSphereIndex = 0; torusSphereIndex < torusSphereCount; torusSphereIndex++) {
+            float3 torusSphereCenter = torus_sphere_world_center(torusBody, torusSphereIndex, params);
+            float3 normalFromTorusToOther;
+            float3 xTorus, xOther;
+            float penetration;
+            if (!sphere_box_contact(torusSphereCenter, torusSphereRadius, box, normalFromTorusToOther, xTorus, xOther, penetration)) {
+                continue;
+            }
+
+            float3 normalAB = torusIsBodyA ? normalFromTorusToOther : -normalFromTorusToOther;
+            if (torusIsBodyA) {
+                append_contact(builder, torusBody, otherBody, xTorus, xOther, AVBD_GPU_FEATURE_TORUS_BOX | (torusSphereIndex & 0xFF));
+            } else {
+                append_contact(builder, otherBody, torusBody, xOther, xTorus, AVBD_GPU_FEATURE_TORUS_BOX | (torusSphereIndex & 0xFF));
+            }
+
+            if (penetration > bestPenetration) {
+                bestPenetration = penetration;
+                bestNormalAB = normalAB;
+            }
+        }
+    } else if (otherBody.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS) {
+        float torusMajorRadius = torus_major_radius(torusBody);
+        float otherSphereRadius = torus_approx_sphere_radius(otherBody, params);
+        float otherMajorRadius = torus_major_radius(otherBody);
+        float4 otherQuatInv = quat_conj(otherBody.positionAng);
+        float reach = torusSphereRadius + otherSphereRadius + params.collisionMargin;
+        float reachSq = reach * reach;
+        float angleStep = 2.0f * M_PI_F / float(torusSphereCount);
+        float invAngleStep = 1.0f / angleStep;
+        float cosStep = cos(angleStep);
+        float sinStep = sin(angleStep);
+        float3 torusAxisX = quat_act(torusBody.positionAng, float3(1, 0, 0));
+        float3 torusAxisY = quat_act(torusBody.positionAng, float3(0, 1, 0));
+        float3 otherAxisX = quat_act(otherBody.positionAng, float3(1, 0, 0));
+        float3 otherAxisY = quat_act(otherBody.positionAng, float3(0, 1, 0));
+        float torusCos = 1.0f;
+        float torusSin = 0.0f;
+
+        for (int torusSphereIndex = 0; torusSphereIndex < torusSphereCount; torusSphereIndex++) {
+            float3 torusSphereCenter = torusBody.positionLin
+                + (torusAxisX * torusCos + torusAxisY * torusSin) * torusMajorRadius;
+
+            // --- 1st stage: Distance to major circle pruning ---
+            float3 localPos = quat_act(otherQuatInv, torusSphereCenter - otherBody.positionLin);
+            float rhoSq = dot(localPos.xy, localPos.xy);
+            float rho = sqrt(max(rhoSq, 0.0f));
+            float radialDelta = rho - otherMajorRadius;
+            float distToCircleSq = radialDelta * radialDelta + localPos.z * localPos.z;
+            if (distToCircleSq <= reachSq) {
+                // --- 2nd stage: Range limiting using angle ---
+                int halfWindow = torusSphereCount / 2;
+                int centerIdx = 0;
+                int candidateCount = torusSphereCount;
+                int startIdx = 0;
+                if (otherMajorRadius > AVBD_GPU_SAT_AXIS_EPSILON && rho > AVBD_GPU_SAT_AXIS_EPSILON) {
+                    float denom = 2.0f * rho * otherMajorRadius;
+                    float cosLimit = (rhoSq + otherMajorRadius * otherMajorRadius + localPos.z * localPos.z - reachSq) / denom;
+                    if (cosLimit > -1.0f) {
+                        float angleRadius = acos(clamp(cosLimit, -1.0f, 1.0f));
+                        halfWindow = min(torusSphereCount / 2, int(ceil(angleRadius * invAngleStep)) + 1);
+                    }
+
+                    float theta = atan2(localPos.y, localPos.x);
+                    if (theta < 0.0f) theta += 2.0f * M_PI_F;
+                    centerIdx = int(round(theta * invAngleStep)) % torusSphereCount;
+                    candidateCount = min(torusSphereCount, halfWindow * 2 + 1);
+                    startIdx = centerIdx - halfWindow;
+                }
+
+                float startAngle = angleStep * float(startIdx);
+                float otherCos = cos(startAngle);
+                float otherSin = sin(startAngle);
+                int rawOtherSphereIndex = startIdx;
+                for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
+                    int otherSphereIndex = rawOtherSphereIndex;
+                    if (otherSphereIndex < 0) {
+                        otherSphereIndex += torusSphereCount;
+                    } else if (otherSphereIndex >= torusSphereCount) {
+                        otherSphereIndex -= torusSphereCount;
+                    }
+
+                    float3 otherSphereCenter = otherBody.positionLin
+                        + (otherAxisX * otherCos + otherAxisY * otherSin) * otherMajorRadius;
+                    float3 normalFromTorusToOther;
+                    float3 xTorus, xOther;
+                    float penetration;
+                    if (sphere_sphere_contact(torusSphereCenter, torusSphereRadius, otherSphereCenter, otherSphereRadius, normalFromTorusToOther, xTorus, xOther, penetration)) {
+                        int featureKey = AVBD_GPU_FEATURE_TORUS_TORUS | ((torusSphereIndex & 0xFF) << 8) | (otherSphereIndex & 0xFF);
+                        float3 normalAB = torusIsBodyA ? normalFromTorusToOther : -normalFromTorusToOther;
+                        if (torusIsBodyA) {
+                            append_contact(builder, torusBody, otherBody, xTorus, xOther, featureKey);
+                        } else {
+                            append_contact(builder, otherBody, torusBody, xOther, xTorus, featureKey);
+                        }
+
+                        if (penetration > bestPenetration) {
+                            bestPenetration = penetration;
+                            bestNormalAB = normalAB;
+                        }
+                    }
+
+                    rawOtherSphereIndex++;
+                    float nextOtherCos = otherCos * cosStep - otherSin * sinStep;
+                    float nextOtherSin = otherSin * cosStep + otherCos * sinStep;
+                    otherCos = nextOtherCos;
+                    otherSin = nextOtherSin;
+                }
+            }
+
+            float nextTorusCos = torusCos * cosStep - torusSin * sinStep;
+            float nextTorusSin = torusSin * cosStep + torusCos * sinStep;
+            torusCos = nextTorusCos;
+            torusSin = nextTorusSin;
+        }
+    }
+
+    if (builder.count <= 0) {
+        return false;
+    }
+
+    basis = orthonormal_basis(-bestNormalAB);
+    if (torusIsBodyA) {
+        finalize_builder_contacts(torusBody, otherBody, builder, basis, collisionMargin);
+    } else {
+        finalize_builder_contacts(otherBody, torusBody, builder, basis, collisionMargin);
+    }
+    return true;
+}
+
+static bool collide_bodies_gpu(device const AVBDGPUBody &bodyA,
+                               device const AVBDGPUBody &bodyB,
+                               thread AVBDGPUContactBuilderMetal &builder,
+                               thread Mat3 &basis,
+                               constant AVBDGPUSolverParams &params,
+                               float collisionMargin)
+{
+    if (bodyA.renderShape == AVBD_GPU_RENDER_SHAPE_SPHERE && bodyB.renderShape == AVBD_GPU_RENDER_SHAPE_SPHERE) {
+        return collide_sphere_sphere_gpu(bodyA, bodyB, builder, basis, params, collisionMargin);
+    }
+    if (bodyA.renderShape == AVBD_GPU_RENDER_SHAPE_SPHERE && bodyB.renderShape == AVBD_GPU_RENDER_SHAPE_BOX) {
+        return collide_sphere_box_gpu(bodyA, bodyB, true, builder, basis, params, collisionMargin);
+    }
+    if (bodyA.renderShape == AVBD_GPU_RENDER_SHAPE_BOX && bodyB.renderShape == AVBD_GPU_RENDER_SHAPE_SPHERE) {
+        return collide_sphere_box_gpu(bodyB, bodyA, false, builder, basis, params, collisionMargin);
+    }
+    if (bodyA.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS) {
+        return collide_torus_body_gpu(bodyA, bodyB, true, builder, basis, params, collisionMargin);
+    }
+    if (bodyB.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS) {
+        return collide_torus_body_gpu(bodyB, bodyA, false, builder, basis, params, collisionMargin);
+    }
+
+    AVBDGPUOBBMetal boxA, boxB;
+    make_obb(bodyA, boxA);
+    make_obb(bodyB, boxB);
+    float3 delta = boxB.center - boxA.center;
+
+    AVBDGPUSatAxisMetal bestFace;
+    bestFace.type = AVBD_GPU_AXIS_FACE_A;
+    bestFace.indexA = -1;
+    bestFace.indexB = -1;
+    bestFace.separation = -FLT_MAX;
+    bestFace.normalAB = float3(0);
+    bestFace.valid = false;
+
+    AVBDGPUSatAxisMetal bestEdge = bestFace;
+    bestEdge.type = AVBD_GPU_AXIS_EDGE;
+
+    for (int i = 0; i < 3; i++) {
+        if (!test_axis(boxA, boxB, delta, boxA.axis[i], AVBD_GPU_AXIS_FACE_A, i, -1, bestFace)) {
+            return false;
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        if (!test_axis(boxA, boxB, delta, boxB.axis[i], AVBD_GPU_AXIS_FACE_B, -1, i, bestFace)) {
+            return false;
+        }
+    }
+
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (!test_axis(boxA, boxB, delta, cross(boxA.axis[i], boxB.axis[j]), AVBD_GPU_AXIS_EDGE, i, j, bestEdge)) {
+                return false;
+            }
+        }
+    }
+
+    if (!bestFace.valid) {
+        return false;
+    }
+
+    AVBDGPUSatAxisMetal best = bestFace;
+    if (bestEdge.valid && 0.95f * bestEdge.separation > bestFace.separation + 0.01f) {
+        best = bestEdge;
+    }
+
+    basis = orthonormal_basis(-best.normalAB);
+
+    if (best.type == AVBD_GPU_AXIS_EDGE) {
+        build_edge_contact(bodyA, bodyB, boxA, boxB, best.indexA, best.indexB, best.normalAB, builder);
+    } else if (best.type == AVBD_GPU_AXIS_FACE_A) {
+        build_face_manifold(bodyA, bodyB, boxA, boxB, true, best.indexA, best.normalAB, builder);
+    } else {
+        build_face_manifold(bodyA, bodyB, boxA, boxB, false, best.indexB, best.normalAB, builder);
+    }
+
+    for (int i = 0; i < builder.count; i++) {
+        float3 xA = quat_act(boxA.rotation, builder.contacts[i].rA) + bodyA.positionLin;
+        float3 xB = quat_act(boxB.rotation, builder.contacts[i].rB) + bodyB.positionLin;
+        float3 diff = xA - xB;
+        builder.contacts[i].C0 = float3(dot(basis.r0, diff), dot(basis.r1, diff), dot(basis.r2, diff)) + float3(collisionMargin, 0, 0);
+        builder.contacts[i].penalty = float3(AVBD_GPU_CONTACT_PENALTY_START);
+        builder.contacts[i].active = 1;
+    }
+
+    return builder.count > 0;
+}
+
+static bool reserve_adjacency_slot(device atomic_int *count, thread int &slot) {
+    int expected = atomic_load_explicit(count, memory_order_relaxed);
+    while (expected < AVBD_MAX_CONSTRAINTS_PER_BODY) {
+        int desired = expected + 1;
+        if (atomic_compare_exchange_weak_explicit(count, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {
+            slot = expected;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void add_joint_adjacency(device AVBDGPUAdjacency *adjacency, int bodyIdx, int jointIdx) {
+    if (bodyIdx < 0) return;
+    int slot = 0;
+    if (reserve_adjacency_slot(&adjacency[bodyIdx].jointCount, slot)) {
+        adjacency[bodyIdx].jointIndices[slot] = jointIdx;
+    }
+}
+
+static void add_spring_adjacency(device AVBDGPUAdjacency *adjacency, int bodyIdx, int springIdx) {
+    if (bodyIdx < 0) return;
+    int slot = 0;
+    if (reserve_adjacency_slot(&adjacency[bodyIdx].springCount, slot)) {
+        adjacency[bodyIdx].springIndices[slot] = springIdx;
+    }
+}
+
+static void add_manifold_adjacency(device AVBDGPUAdjacency *adjacency, int bodyIdx, int manifoldIdx) {
+    if (bodyIdx < 0) return;
+    int slot = 0;
+    if (reserve_adjacency_slot(&adjacency[bodyIdx].manifoldCount, slot)) {
+        adjacency[bodyIdx].manifoldIndices[slot] = manifoldIdx;
+    }
+}
+
+// Geometric stiffness for ball-socket
+static Mat3 geom_stiffness_bs(int k, float3 v) {
+    Mat3 m = Mat3::diag(-v[k], -v[k], -v[k]);
+    // Add v outer e_k
+    m.r0[k] += v[0];
+    m.r1[k] += v[1];
+    m.r2[k] += v[2];
+    return m;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 6×6 LDLT solve (inline, identical to CPU version)
+// ─────────────────────────────────────────────────────────────
+static void solve_6x6(Mat3 aLin, Mat3 aAng, Mat3 aCross,
+                       float3 bLin, float3 bAng,
+                       thread float3 &xLin, thread float3 &xAng)
+{
+    float A11 = aLin.r0[0];
+    float A21 = aLin.r1[0], A22 = aLin.r1[1];
+    float A31 = aLin.r2[0], A32 = aLin.r2[1], A33 = aLin.r2[2];
+    float A41 = aCross.r0[0], A42 = aCross.r0[1], A43 = aCross.r0[2], A44 = aAng.r0[0];
+    float A51 = aCross.r1[0], A52 = aCross.r1[1], A53 = aCross.r1[2], A54 = aAng.r1[0], A55 = aAng.r1[1];
+    float A61 = aCross.r2[0], A62 = aCross.r2[1], A63 = aCross.r2[2], A64 = aAng.r2[0], A65 = aAng.r2[1], A66 = aAng.r2[2];
+
+    if (abs(A11) < 1e-12f) A11 = 1e-12f;
+
+    float L21 = A21 / A11;
+    float L31 = A31 / A11;
+    float L41 = A41 / A11;
+    float L51 = A51 / A11;
+    float L61 = A61 / A11;
+
+    float D1 = A11;
+    float D2 = A22 - L21 * L21 * D1;
+    if (abs(D2) < 1e-12f) D2 = 1e-12f;
+
+    float L32 = (A32 - L21 * L31 * D1) / D2;
+    float L42 = (A42 - L21 * L41 * D1) / D2;
+    float L52 = (A52 - L21 * L51 * D1) / D2;
+    float L62 = (A62 - L21 * L61 * D1) / D2;
+
+    float D3 = A33 - (L31 * L31 * D1 + L32 * L32 * D2);
+    if (abs(D3) < 1e-12f) D3 = 1e-12f;
+
+    float L43 = (A43 - L31 * L41 * D1 - L32 * L42 * D2) / D3;
+    float L53 = (A53 - L31 * L51 * D1 - L32 * L52 * D2) / D3;
+    float L63 = (A63 - L31 * L61 * D1 - L32 * L62 * D2) / D3;
+
+    float D4 = A44 - (L41 * L41 * D1 + L42 * L42 * D2 + L43 * L43 * D3);
+    if (abs(D4) < 1e-12f) D4 = 1e-12f;
+
+    float L54 = (A54 - L41 * L51 * D1 - L42 * L52 * D2 - L43 * L53 * D3) / D4;
+    float L64 = (A64 - L41 * L61 * D1 - L42 * L62 * D2 - L43 * L63 * D3) / D4;
+
+    float D5 = A55 - (L51 * L51 * D1 + L52 * L52 * D2 + L53 * L53 * D3 + L54 * L54 * D4);
+    if (abs(D5) < 1e-12f) D5 = 1e-12f;
+
+    float L65 = (A65 - L51 * L61 * D1 - L52 * L62 * D2 - L53 * L63 * D3 - L54 * L64 * D4) / D5;
+
+    float D6 = A66 - (L61 * L61 * D1 + L62 * L62 * D2 + L63 * L63 * D3 + L64 * L64 * D4 + L65 * L65 * D5);
+    if (abs(D6) < 1e-12f) D6 = 1e-12f;
+
+    float y1 = bLin[0];
+    float y2 = bLin[1] - L21 * y1;
+    float y3 = bLin[2] - L31 * y1 - L32 * y2;
+    float y4 = bAng[0] - L41 * y1 - L42 * y2 - L43 * y3;
+    float y5 = bAng[1] - L51 * y1 - L52 * y2 - L53 * y3 - L54 * y4;
+    float y6 = bAng[2] - L61 * y1 - L62 * y2 - L63 * y3 - L64 * y4 - L65 * y5;
+
+    float z1 = y1 / D1, z2 = y2 / D2, z3 = y3 / D3;
+    float z4 = y4 / D4, z5 = y5 / D5, z6 = y6 / D6;
+
+    xAng[2] = z6;
+    xAng[1] = z5 - L65 * xAng[2];
+    xAng[0] = z4 - L54 * xAng[1] - L64 * xAng[2];
+    xLin[2] = z3 - L43 * xAng[0] - L53 * xAng[1] - L63 * xAng[2];
+    xLin[1] = z2 - L32 * xLin[2] - L42 * xAng[0] - L52 * xAng[1] - L62 * xAng[2];
+    xLin[0] = z1 - L21 * xLin[1] - L31 * xLin[2] - L41 * xAng[0] - L51 * xAng[1] - L61 * xAng[2];
+}
+
+// ─────────────────────────────────────────────────────────────
+// GPU broadphase and adjacency rebuild
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_reset_adjacency(
+    device AVBDGPUAdjacency *adjacency [[buffer(0)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(1)]],
+    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(2)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(3)]],
+    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(4)]],
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(5)]],
+    constant AVBDGPUSolverParams &params [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid == 0) {
+        atomic_store_explicit(&contactAllocator[0].nextContactIndex, 0, memory_order_relaxed);
+        atomic_store_explicit(&nextRecentPairState[0].count, 0, memory_order_relaxed);
+        atomic_store_explicit(&activeManifoldState[0].count, 0, memory_order_relaxed);
+        atomic_store_explicit(&manifoldAllocator[0].nextManifoldIndex, 0, memory_order_relaxed);
+        atomic_store_explicit(&derivedPairState[0].count, 0, memory_order_relaxed);
+    }
+
+    if (tid >= uint(params.bodyCount)) return;
+
+    device AVBDGPUAdjacency &adj = adjacency[tid];
+    atomic_store_explicit(&adj.jointCount, 0, memory_order_relaxed);
+    atomic_store_explicit(&adj.springCount, 0, memory_order_relaxed);
+    atomic_store_explicit(&adj.manifoldCount, 0, memory_order_relaxed);
+}
+
+static void process_broadphase_pair_derived(
+    int bodyIdxA,
+    int bodyIdxB,
+    int manifoldSlot,
+    device AVBDGPUBody *bodies,
+    device AVBDGPUManifold *manifolds,
+    device AVBDGPUContact *allContacts,
+    device AVBDGPUContactAllocator &contactAllocator,
+    constant AVBDGPUSolverParams &params,
+    thread bool &shouldEmitActiveManifold)
+{
+    device AVBDGPUBody &bodyA = bodies[bodyIdxA];
+    device AVBDGPUBody &bodyB = bodies[bodyIdxB];
+    device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+
+    manifold.bodyA = bodyIdxA;
+    manifold.bodyB = bodyIdxB;
+    manifold.contactCount = 0;
+    manifold.contactBaseIndex = -1;
+    manifold.active = 0;
+    manifold.friction = sqrt(bodyA.friction * bodyB.friction);
+    manifold.basisR0 = float3(1, 0, 0);
+    manifold.basisR1 = float3(0, 1, 0);
+    manifold.basisR2 = float3(0, 0, 1);
+
+    float3 dp = bodyA.positionLin - bodyB.positionLin;
+    float radiusA = body_radius(bodyA, params);
+    float radiusB = body_radius(bodyB, params);
+    float radius = radiusA + radiusB;
+    float distSq = length_squared(dp);
+
+    if (distSq > radius * radius) {
+        return;
+    }
+
+    AVBDGPUContactBuilderMetal builder;
+    builder.count = 0;
+    Mat3 basis = Mat3::identity();
+    if (!collide_bodies_gpu(bodyA, bodyB, builder, basis, params, params.collisionMargin)) {
+        return;
+    }
+
+    manifold.basisR0 = basis.r0;
+    manifold.basisR1 = basis.r1;
+    manifold.basisR2 = basis.r2;
+    int contactBaseIndex = -1;
+    manifold.contactCount = reserve_contact_range(contactAllocator, builder.count, contactBaseIndex);
+    manifold.contactBaseIndex = contactBaseIndex;
+    manifold.active = (manifold.contactCount > 0) ? 1 : 0;
+    shouldEmitActiveManifold = manifold.active != 0;
+    for (int i = 0; i < manifold.contactCount; i++) {
+        allContacts[manifold.contactBaseIndex + i] = builder.contacts[i];
+    }
+}
+
+kernel void avbd_broadphase_full(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device AVBDGPUCollisionExclusion *exclusions [[buffer(1)]],
+    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(2)]],
+    device AVBDGPUManifold *manifolds [[buffer(3)]],
+    device AVBDGPUContact *allContacts [[buffer(4)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(5)]],
+    device int *nextRecentPairIndices [[buffer(6)]],
+    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(7)]],
+    device int *activeManifoldIndices [[buffer(8)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(9)]],
+    constant AVBDGPUSolverParams &params [[buffer(10)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tid [[thread_position_in_grid]])
+{
+    threadgroup int cachedPairValues[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int cachedPairRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int cachedPairBaseIndex;
+    threadgroup int cachedPairGrantedCount;
+    threadgroup int manifoldSlotRequests[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int manifoldSlotRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int manifoldSlotBaseIndex;
+    threadgroup int manifoldSlotGrantedCount;
+    threadgroup int activeManifoldLocalIndices[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int activeManifoldRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int activeManifoldBaseIndex;
+    threadgroup int activeManifoldGrantedCount;
+
+    int n = params.bodyCount;
+    int totalPairs = n * (n - 1) / 2;
+    bool validThread = int(tid) < totalPairs;
+    bool shouldCachePair = false;
+    bool needsManifoldSlot = false;
+    int encodedPair = -1;
+    int bodyA = -1, bodyB = -1;
+
+    cachedPairValues[lid] = -1;
+    manifoldSlotRequests[lid] = 0;
+
+    if (validThread) {
+        upper_triangle_pair(tid, n, bodyA, bodyB);
+
+        if (bodyA >= 0 && bodyB >= 0 && bodyA < n && bodyB < n
+            && !(bodies[bodyA].mass <= 0.0f && bodies[bodyB].mass <= 0.0f)
+            && !is_excluded(exclusions, bodyA, bodyB))
+        {
+            float radiusA = body_radius(bodies[bodyA], params);
+            float radiusB = body_radius(bodies[bodyB], params);
+            float3 dp = bodies[bodyA].positionLin - bodies[bodyB].positionLin;
+            float radius = radiusA + radiusB;
+            float relativeSpeed = length(bodies[bodyA].velocityLin - bodies[bodyB].velocityLin);
+            float gravityExpansion = 0.5f * abs(params.gravity) * params.cacheTimeHorizon * params.cacheTimeHorizon;
+            float predictiveMargin = params.cacheMargin + relativeSpeed * params.cacheTimeHorizon + gravityExpansion;
+            float cacheRadius = radius + predictiveMargin;
+            float distSq = length_squared(dp);
+
+            if (distSq <= cacheRadius * cacheRadius) {
+                shouldCachePair = true;
+                encodedPair = (bodyA << 16) | bodyB;
+
+                if (distSq <= radius * radius) {
+                    needsManifoldSlot = true;
+                }
+            }
+        }
+    }
+
+    cachedPairValues[lid] = shouldCachePair ? encodedPair : -1;
+    manifoldSlotRequests[lid] = needsManifoldSlot ? 1 : 0;
+
+    // --- Barrier 1: sync broadphase results for batch reservation ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        // Batch-reserve pair cache
+        int cachedPairLocalCount = 0;
+        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
+            cachedPairRanks[i] = (cachedPairValues[i] >= 0) ? cachedPairLocalCount++ : -1;
+        }
+        int reservedBaseIndex = 0;
+        cachedPairGrantedCount = reserve_recent_pair_range(nextRecentPairState[0], cachedPairLocalCount, reservedBaseIndex);
+        cachedPairBaseIndex = reservedBaseIndex;
+
+        // Batch-reserve manifold slots
+        int manifoldRequestCount = 0;
+        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
+            manifoldSlotRanks[i] = manifoldSlotRequests[i] ? manifoldRequestCount++ : -1;
+        }
+        reservedBaseIndex = 0;
+        manifoldSlotGrantedCount = reserve_manifold_range(manifoldAllocator[0], manifoldRequestCount, reservedBaseIndex);
+        manifoldSlotBaseIndex = reservedBaseIndex;
+    }
+
+    // --- Barrier 2: sync assigned slots for narrowphase + pair write ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write pair cache
+    if (cachedPairValues[lid] >= 0 && cachedPairRanks[lid] >= 0 && cachedPairRanks[lid] < cachedPairGrantedCount) {
+        nextRecentPairIndices[cachedPairBaseIndex + cachedPairRanks[lid]] = cachedPairValues[lid];
+    }
+
+    // Run narrowphase with batch-assigned manifold slot
+    bool shouldEmitActiveManifold = false;
+    int manifoldSlot = -1;
+    activeManifoldLocalIndices[lid] = -1;
+
+    if (manifoldSlotRanks[lid] >= 0 && manifoldSlotRanks[lid] < manifoldSlotGrantedCount) {
+        manifoldSlot = manifoldSlotBaseIndex + manifoldSlotRanks[lid];
+        process_broadphase_pair_derived(
+            bodyA, bodyB, manifoldSlot,
+            bodies, manifolds, allContacts,
+            contactAllocator[0], params,
+            shouldEmitActiveManifold);
+        activeManifoldLocalIndices[lid] = shouldEmitActiveManifold ? manifoldSlot : -1;
+    }
+
+    // --- Barrier 3: sync narrowphase results for active manifold batch ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        int activeManifoldLocalCount = 0;
+        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
+            activeManifoldRanks[i] = (activeManifoldLocalIndices[i] >= 0) ? activeManifoldLocalCount++ : -1;
+        }
+        int reservedBaseIndex = 0;
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], activeManifoldLocalCount, reservedBaseIndex);
+        activeManifoldBaseIndex = reservedBaseIndex;
+    }
+
+    // --- Barrier 4: sync active manifold reservation for write ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (activeManifoldLocalIndices[lid] >= 0 && activeManifoldRanks[lid] >= 0 && activeManifoldRanks[lid] < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + activeManifoldRanks[lid]] = activeManifoldLocalIndices[lid];
+    }
+}
+
+kernel void avbd_broadphase_partial(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device int *currentRecentPairIndices [[buffer(1)]],
+    device AVBDGPURecentPairCacheState *currentRecentPairState [[buffer(2)]],
+    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(3)]],
+    device AVBDGPUManifold *manifolds [[buffer(4)]],
+    device AVBDGPUContact *allContacts [[buffer(5)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(6)]],
+    device int *nextRecentPairIndices [[buffer(7)]],
+    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(8)]],
+    device int *activeManifoldIndices [[buffer(9)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(10)]],
+    constant AVBDGPUSolverParams &params [[buffer(11)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tid [[thread_position_in_grid]])
+{
+    threadgroup int cachedPairValues[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int cachedPairRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int cachedPairBaseIndex;
+    threadgroup int cachedPairGrantedCount;
+    threadgroup int manifoldSlotRequests[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int manifoldSlotRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int manifoldSlotBaseIndex;
+    threadgroup int manifoldSlotGrantedCount;
+    threadgroup int activeManifoldLocalIndices[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int activeManifoldRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
+    threadgroup int activeManifoldBaseIndex;
+    threadgroup int activeManifoldGrantedCount;
+
+    int currentRecentPairCount = atomic_load_explicit(&currentRecentPairState[0].count, memory_order_relaxed);
+    bool validThread = tid < uint(currentRecentPairCount);
+    bool shouldCachePair = false;
+    bool needsManifoldSlot = false;
+    int encodedPair = -1;
+    int bodyA = -1, bodyB = -1;
+
+    cachedPairValues[lid] = -1;
+    manifoldSlotRequests[lid] = 0;
+
+    if (validThread) {
+        encodedPair = currentRecentPairIndices[tid];
+        bodyA = encodedPair >> 16;
+        bodyB = encodedPair & 0xFFFF;
+
+        if (bodyA >= 0 && bodyB >= 0 && bodyA < params.bodyCount && bodyB < params.bodyCount) {
+            float radiusA = body_radius(bodies[bodyA], params);
+            float radiusB = body_radius(bodies[bodyB], params);
+            float3 dp = bodies[bodyA].positionLin - bodies[bodyB].positionLin;
+            float radius = radiusA + radiusB;
+            float relativeSpeed = length(bodies[bodyA].velocityLin - bodies[bodyB].velocityLin);
+            float gravityExpansion = 0.5f * abs(params.gravity) * params.cacheTimeHorizon * params.cacheTimeHorizon;
+            float predictiveMargin = params.cacheMargin + relativeSpeed * params.cacheTimeHorizon + gravityExpansion;
+            float cacheRadius = radius + predictiveMargin;
+            float distSq = length_squared(dp);
+
+            if (distSq <= cacheRadius * cacheRadius) {
+                shouldCachePair = true;
+
+                if (distSq <= radius * radius) {
+                    needsManifoldSlot = true;
+                }
+            }
+        }
+    }
+
+    cachedPairValues[lid] = shouldCachePair ? encodedPair : -1;
+    manifoldSlotRequests[lid] = needsManifoldSlot ? 1 : 0;
+
+    // --- Barrier 1: sync broadphase results for batch reservation ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        // Batch-reserve pair cache
+        int cachedPairLocalCount = 0;
+        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
+            cachedPairRanks[i] = (cachedPairValues[i] >= 0) ? cachedPairLocalCount++ : -1;
+        }
+        int reservedBaseIndex = 0;
+        cachedPairGrantedCount = reserve_recent_pair_range(nextRecentPairState[0], cachedPairLocalCount, reservedBaseIndex);
+        cachedPairBaseIndex = reservedBaseIndex;
+
+        // Batch-reserve manifold slots
+        int manifoldRequestCount = 0;
+        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
+            manifoldSlotRanks[i] = manifoldSlotRequests[i] ? manifoldRequestCount++ : -1;
+        }
+        reservedBaseIndex = 0;
+        manifoldSlotGrantedCount = reserve_manifold_range(manifoldAllocator[0], manifoldRequestCount, reservedBaseIndex);
+        manifoldSlotBaseIndex = reservedBaseIndex;
+    }
+
+    // --- Barrier 2: sync assigned slots for narrowphase + pair write ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write pair cache
+    if (cachedPairValues[lid] >= 0 && cachedPairRanks[lid] >= 0 && cachedPairRanks[lid] < cachedPairGrantedCount) {
+        nextRecentPairIndices[cachedPairBaseIndex + cachedPairRanks[lid]] = cachedPairValues[lid];
+    }
+
+    // Run narrowphase with batch-assigned manifold slot
+    bool shouldEmitActiveManifold = false;
+    int manifoldSlot = -1;
+    activeManifoldLocalIndices[lid] = -1;
+
+    if (manifoldSlotRanks[lid] >= 0 && manifoldSlotRanks[lid] < manifoldSlotGrantedCount) {
+        manifoldSlot = manifoldSlotBaseIndex + manifoldSlotRanks[lid];
+        process_broadphase_pair_derived(
+            bodyA, bodyB, manifoldSlot,
+            bodies, manifolds, allContacts,
+            contactAllocator[0], params,
+            shouldEmitActiveManifold);
+        activeManifoldLocalIndices[lid] = shouldEmitActiveManifold ? manifoldSlot : -1;
+    }
+
+    // --- Barrier 3: sync narrowphase results for active manifold batch ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        int activeManifoldLocalCount = 0;
+        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
+            activeManifoldRanks[i] = (activeManifoldLocalIndices[i] >= 0) ? activeManifoldLocalCount++ : -1;
+        }
+        int reservedBaseIndex = 0;
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], activeManifoldLocalCount, reservedBaseIndex);
+        activeManifoldBaseIndex = reservedBaseIndex;
+    }
+
+    // --- Barrier 4: sync active manifold reservation for write ---
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (activeManifoldLocalIndices[lid] >= 0 && activeManifoldRanks[lid] >= 0 && activeManifoldRanks[lid] < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + activeManifoldRanks[lid]] = activeManifoldLocalIndices[lid];
+    }
+}
+
+kernel void avbd_process_broadphase_pair_derived(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device int *derivedPairIndices [[buffer(1)]],
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(2)]],
+    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(3)]],
+    device AVBDGPUManifold *manifolds [[buffer(4)]],
+    device AVBDGPUContact *allContacts [[buffer(5)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(6)]],
+    device int *activeManifoldIndices [[buffer(7)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(8)]],
+    constant AVBDGPUSolverParams &params [[buffer(9)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tid [[thread_position_in_grid]])
+{
+    threadgroup int activeManifoldLocalIndices[AVBD_DERIVED_THREADGROUP_SIZE];
+    threadgroup int activeManifoldRanks[AVBD_DERIVED_THREADGROUP_SIZE];
+    threadgroup int activeManifoldBaseIndex;
+    threadgroup int activeManifoldGrantedCount;
+
+    int derivedPairCount = atomic_load_explicit(&derivedPairState[0].count, memory_order_relaxed);
+    bool validThread = tid < uint(derivedPairCount);
+    bool shouldEmitActiveManifold = false;
+    int manifoldSlot = -1;
+
+    activeManifoldLocalIndices[lid] = -1;
+
+    if (validThread) {
+        int encodedPair = derivedPairIndices[tid];
+        int bodyA = encodedPair >> 16;
+        int bodyB = encodedPair & 0xFFFF;
+        manifoldSlot = reserve_manifold_slot(manifoldAllocator[0]);
+        if (manifoldSlot >= 0) {
+            process_broadphase_pair_derived(
+                bodyA, bodyB, manifoldSlot,
+                bodies, manifolds, allContacts,
+                contactAllocator[0], params,
+                shouldEmitActiveManifold);
+        }
+    }
+
+    activeManifoldLocalIndices[lid] = shouldEmitActiveManifold ? manifoldSlot : -1;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        int activeManifoldLocalCount = 0;
+        for (uint i = 0; i < AVBD_DERIVED_THREADGROUP_SIZE; i++) {
+            activeManifoldRanks[i] = (activeManifoldLocalIndices[i] >= 0) ? activeManifoldLocalCount++ : -1;
+        }
+        int reservedBaseIndex = 0;
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], activeManifoldLocalCount, reservedBaseIndex);
+        activeManifoldBaseIndex = reservedBaseIndex;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (activeManifoldLocalIndices[lid] >= 0 && activeManifoldRanks[lid] >= 0 && activeManifoldRanks[lid] < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + activeManifoldRanks[lid]] = activeManifoldLocalIndices[lid];
+    }
+}
+
+kernel void avbd_prepare_broadphase_indirect(
+    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(0)]],
+    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    int pairCount = atomic_load_explicit(&nextRecentPairState[0].count, memory_order_relaxed);
+    uint threadgroupsX = uint(max(pairCount, 0) + AVBD_BROADPHASE_THREADGROUP_SIZE - 1) / AVBD_BROADPHASE_THREADGROUP_SIZE;
+    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
+    indirectArgs[0].threadgroupsPerGrid[1] = 1;
+    indirectArgs[0].threadgroupsPerGrid[2] = 1;
+}
+
+kernel void avbd_prepare_derived_pairs_indirect(
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(0)]],
+    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    int derivedPairCount = atomic_load_explicit(&derivedPairState[0].count, memory_order_relaxed);
+    uint threadgroupsX = uint(max(derivedPairCount, 0) + AVBD_DERIVED_THREADGROUP_SIZE - 1) / AVBD_DERIVED_THREADGROUP_SIZE;
+    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
+    indirectArgs[0].threadgroupsPerGrid[1] = 1;
+    indirectArgs[0].threadgroupsPerGrid[2] = 1;
+}
+
+kernel void avbd_prepare_active_manifolds_indirect(
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(0)]],
+    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    int manifoldCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    uint threadgroupsX = uint(max(manifoldCount, 0) + AVBD_BROADPHASE_THREADGROUP_SIZE - 1) / AVBD_BROADPHASE_THREADGROUP_SIZE;
+    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
+    indirectArgs[0].threadgroupsPerGrid[1] = 1;
+    indirectArgs[0].threadgroupsPerGrid[2] = 1;
+}
+
+kernel void avbd_build_adjacency_constraints(
+    device AVBDGPUJoint *joints [[buffer(0)]],
+    device AVBDGPUSpring *springs [[buffer(1)]],
+    device AVBDGPUAdjacency *adjacency [[buffer(2)]],
+    constant AVBDGPUSolverParams &params [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid < uint(params.jointCount)) {
+        device AVBDGPUJoint &j = joints[tid];
+        if (!j.broken) {
+            add_joint_adjacency(adjacency, j.bodyA, int(tid));
+            add_joint_adjacency(adjacency, j.bodyB, int(tid));
+        }
+    }
+
+    if (tid < uint(params.springCount)) {
+        device AVBDGPUSpring &s = springs[tid];
+        add_spring_adjacency(adjacency, s.bodyA, int(tid));
+        add_spring_adjacency(adjacency, s.bodyB, int(tid));
+    }
+}
+
+kernel void avbd_build_adjacency_manifolds(
+    device AVBDGPUManifold *manifolds [[buffer(0)]],
+    device int *activeManifoldIndices [[buffer(1)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(2)]],
+    device AVBDGPUAdjacency *adjacency [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int activeManifoldCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    if (tid >= uint(activeManifoldCount)) return;
+
+    int manifoldIndex = activeManifoldIndices[tid];
+    device AVBDGPUManifold &m = manifolds[manifoldIndex];
+    add_manifold_adjacency(adjacency, m.bodyA, manifoldIndex);
+    add_manifold_adjacency(adjacency, m.bodyB, manifoldIndex);
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 1: Forward Integration
+//   Sets inertial targets and initial positions, then
+//   forward-integrates dynamic bodies.
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_forward_integrate(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    constant AVBDGPUSolverParams &params [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(params.bodyCount)) return;
+
+    device AVBDGPUBody &b = bodies[tid];
+    float dt = params.dt;
+    float gravity = params.gravity;
+
+    // Compute inertial target
+    b.inertialLin = b.positionLin + b.velocityLin * dt;
+    if (b.mass > 0.0f) {
+        b.inertialLin += float3(0, 0, gravity) * (dt * dt);
+    }
+    b.inertialAng = quat_add_angular(b.positionAng, b.velocityAng * dt);
+
+    // Acceleration-based weight for position prediction
+    float3 accel = (b.velocityLin - b.prevVelocityLin) / dt;
+    float accelExt = accel.z * sign_f(gravity);
+    float accelWeight = 0.0f;
+    if (abs(gravity) > 1e-6f) {
+        accelWeight = clamp(accelExt / abs(gravity), 0.0f, 1.0f);
+    }
+    // ensure accelWeight is not NaN
+    if (!(accelWeight >= 0.0f)) accelWeight = 0.0f;
+
+    // Snapshot initial state
+    b.initialLin = b.positionLin;
+    b.initialAng = b.positionAng;
+
+    // Forward integrate dynamic bodies
+    if (b.mass > 0.0f) {
+        b.positionLin = b.positionLin + b.velocityLin * dt + float3(0, 0, gravity) * (accelWeight * dt * dt);
+        b.positionAng = quat_add_angular(b.positionAng, b.velocityAng * dt);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 2: Initialize Joints
+//   Computes C0, decays penalty & lambda for warm-start.
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_init_joints(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device AVBDGPUJoint *joints [[buffer(1)]],
+    constant AVBDGPUSolverParams &params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(params.jointCount)) return;
+
+    device AVBDGPUJoint &j = joints[tid];
+    if (j.broken) return;
+
+    float3 posA, rA_local = j.rA;
+    float4 quatA;
+    if (j.bodyA >= 0) {
+        posA = bodies[j.bodyA].initialLin;
+        quatA = bodies[j.bodyA].initialAng;
+    } else {
+        posA = float3(0);
+        quatA = float4(0, 0, 0, 1);
+    }
+
+    float3 posB = bodies[j.bodyB].initialLin;
+    float4 quatB = bodies[j.bodyB].initialAng;
+
+    float3 pA = xform(posA, quatA, rA_local);
+    float3 pB = xform(posB, quatB, j.rB);
+    j.C0Lin = pA - pB;
+
+    float4 quatAForAng = (j.bodyA >= 0) ? quatA : float4(0, 0, 0, 1);
+    j.C0Ang = quat_delta(quatAForAng, quatB) * j.torqueArm;
+
+    j.lambdaLin *= params.alpha * params.gamma;
+    j.lambdaAng *= params.alpha * params.gamma;
+    j.penaltyLin = clamp_vec(j.penaltyLin * params.gamma, params.penaltyMin, params.penaltyMax);
+    j.penaltyAng = clamp_vec(j.penaltyAng * params.gamma, params.penaltyMin, params.penaltyMax);
+    j.penaltyLin = min_vec(j.penaltyLin, j.stiffnessLin);
+    j.penaltyAng = min_vec(j.penaltyAng, j.stiffnessAng);
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 3: Body Solve (Jacobi iteration)
+//   For each dynamic body: accumulate forces from joints,
+//   springs, and manifolds, then solve 6×6 and update pose.
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_body_solve(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device AVBDGPUJoint *joints [[buffer(1)]],
+    device AVBDGPUSpring *springs [[buffer(2)]],
+    device AVBDGPUManifold *manifolds [[buffer(3)]],
+    device AVBDGPUAdjacency *adjacency [[buffer(4)]],
+    device AVBDGPUContact *allContacts [[buffer(5)]],
+    constant AVBDGPUSolverParams &params [[buffer(6)]],
+    device const int *bodyColors [[buffer(7)]],
+    constant int &currentColor [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(params.bodyCount)) return;
+    if (bodyColors[tid] != currentColor) return;
+
+    device AVBDGPUBody &body = bodies[tid];
+    if (body.mass <= 0.0f) return;
+
+    float dt = params.dt;
+    float alpha = params.alpha;
+    float dt2 = dt * dt;
+
+    Mat3 mLin = Mat3::diag(body.mass, body.mass, body.mass);
+    Mat3 mAng = Mat3::diag3(body.moment);
+
+    Mat3 lhsLin = mLin / dt2;
+    Mat3 lhsAng = mAng / dt2;
+    Mat3 lhsCross;
+    float3 rhsLin = (mLin / dt2).mul(body.positionLin - body.inertialLin);
+    float3 rhsAng = (mAng / dt2).mul(quat_delta(body.positionAng, body.inertialAng));
+
+    device AVBDGPUAdjacency &adj = adjacency[tid];
+
+    // ── Accumulate joint forces ──
+    int jointAdjCount = atomic_load_explicit(&adj.jointCount, memory_order_relaxed);
+    for (int ji = 0; ji < jointAdjCount; ji++) {
+        device AVBDGPUJoint &j = joints[adj.jointIndices[ji]];
+        if (j.broken) continue;
+
+        bool isA = (j.bodyA == int(tid));
+
+        // Linear penalty
+        if (length_squared(j.penaltyLin) > 0.0f) {
+            Mat3 K = Mat3::diag3(j.penaltyLin);
+
+            float3 posAFull, rA_local = j.rA;
+            float4 quatAFull;
+            if (j.bodyA >= 0) {
+                posAFull = bodies[j.bodyA].positionLin;
+                quatAFull = bodies[j.bodyA].positionAng;
+            } else {
+                posAFull = float3(0);
+                quatAFull = float4(0, 0, 0, 1);
+            }
+
+            float3 pA = xform(posAFull, quatAFull, rA_local);
+            float3 pB = xform(bodies[j.bodyB].positionLin, bodies[j.bodyB].positionAng, j.rB);
+            float3 C = pA - pB;
+
+            if (j.stiffnessLin >= 1e30f) {
+                C -= j.C0Lin * alpha;
+            }
+
+            float3 F = K.mul(C) + j.lambdaLin;
+
+            Mat3 jLin = isA ? Mat3::identity() : Mat3::identity() * (-1.0f);
+            float3 rWorld;
+            Mat3 jAng;
+            if (isA) {
+                rWorld = quat_act(quatAFull, rA_local);
+                jAng = skew(-rWorld);
+            } else {
+                rWorld = quat_act(bodies[j.bodyB].positionAng, j.rB);
+                jAng = skew(rWorld);
+            }
+
+            Mat3 jLinT = mat3_transpose(jLin);
+            Mat3 jAngT = mat3_transpose(jAng);
+            Mat3 jAngTk = mat3_mul(jAngT, K);
+
+            lhsLin = lhsLin + mat3_mul(mat3_mul(jLinT, K), jLin);
+            lhsAng = lhsAng + mat3_mul(jAngTk, jAng);
+            lhsCross = lhsCross + mat3_mul(jAngTk, jLin);
+
+            float3 r = isA ? quat_act(quatAFull, rA_local) : -quat_act(bodies[j.bodyB].positionAng, j.rB);
+            Mat3 H = geom_stiffness_bs(0, r) * F[0]
+                   + geom_stiffness_bs(1, r) * F[1]
+                   + geom_stiffness_bs(2, r) * F[2];
+            lhsAng = lhsAng + diagonalize_mat(H);
+
+            rhsLin = rhsLin + jLinT.mul(F);
+            rhsAng = rhsAng + jAngT.mul(F);
+        }
+
+        // Angular penalty
+        if (length_squared(j.penaltyAng) > 0.0f) {
+            Mat3 K = Mat3::diag3(j.penaltyAng);
+            float4 quatAForAng2 = (j.bodyA >= 0) ? bodies[j.bodyA].positionAng : float4(0, 0, 0, 1);
+            float3 C = quat_delta(quatAForAng2, bodies[j.bodyB].positionAng) * j.torqueArm;
+
+            if (j.stiffnessAng >= 1e30f) {
+                C -= j.C0Ang * alpha;
+            }
+
+            float3 F = K.mul(C) + j.lambdaAng;
+            Mat3 jAng2 = isA ? Mat3::identity() * j.torqueArm : Mat3::identity() * (-j.torqueArm);
+
+            lhsAng = lhsAng + mat3_mul(mat3_mul(mat3_transpose(jAng2), K), jAng2);
+            rhsAng = rhsAng + mat3_transpose(jAng2).mul(F);
+        }
+    }
+
+    // ── Accumulate spring forces ──
+    int springAdjCount = atomic_load_explicit(&adj.springCount, memory_order_relaxed);
+    for (int si = 0; si < springAdjCount; si++) {
+        device AVBDGPUSpring &s = springs[adj.springIndices[si]];
+        float3 pA = xform(bodies[s.bodyA].positionLin, bodies[s.bodyA].positionAng, s.rA);
+        float3 pB = xform(bodies[s.bodyB].positionLin, bodies[s.bodyB].positionAng, s.rB);
+        float3 d = pA - pB;
+        float dLen = length(d);
+        if (dLen <= 1.0e-6f) continue;
+
+        float3 n = d / dLen;
+        float C_spring = dLen - s.rest;
+        float f = s.stiffness * C_spring;
+
+        bool isBodyA = (s.bodyA == int(tid));
+        float3 rWorld;
+        float3 jLin, jAngV;
+        if (isBodyA) {
+            rWorld = quat_act(bodies[s.bodyA].positionAng, s.rA);
+            jLin = n;
+            jAngV = cross(rWorld, n);
+        } else {
+            rWorld = quat_act(bodies[s.bodyB].positionAng, s.rB);
+            jLin = -n;
+            jAngV = -cross(rWorld, n);
+        }
+
+        lhsLin = lhsLin + outer(jLin, jLin) * s.stiffness;
+        lhsAng = lhsAng + outer(jAngV, jAngV) * s.stiffness;
+        lhsCross = lhsCross + outer(jAngV, jLin) * s.stiffness;
+        rhsLin = rhsLin + jLin * f;
+        rhsAng = rhsAng + jAngV * f;
+    }
+
+    // ── Accumulate manifold (contact) forces ──
+    int manifoldAdjCount = atomic_load_explicit(&adj.manifoldCount, memory_order_relaxed);
+    for (int mi = 0; mi < manifoldAdjCount; mi++) {
+        device AVBDGPUManifold &m = manifolds[adj.manifoldIndices[mi]];
+        if (!m.active || m.contactCount == 0) continue;
+
+        Mat3 basis(m.basisR0, m.basisR1, m.basisR2);
+        bool isBodyA = (m.bodyA == int(tid));
+
+        device AVBDGPUBody &bA = bodies[m.bodyA];
+        device AVBDGPUBody &bB = bodies[m.bodyB];
+
+        float3 dqALin = bA.positionLin - bA.initialLin;
+        float3 dqAAng = quat_delta(bA.positionAng, bA.initialAng);
+        float3 dqBLin = bB.positionLin - bB.initialLin;
+        float3 dqBAng = quat_delta(bB.positionAng, bB.initialAng);
+
+        for (int ci = 0; ci < m.contactCount; ci++) {
+            device AVBDGPUContact &ct = allContacts[m.contactBaseIndex + ci];
+            if (!ct.active) continue;
+
+            float3 rAWorld = quat_act(bA.positionAng, ct.rA);
+            float3 rBWorld = quat_act(bB.positionAng, ct.rB);
+
+            Mat3 jALin = basis;
+            Mat3 jBLin = basis * (-1.0f);
+            Mat3 jAAng = Mat3(cross(rAWorld, jALin.r0), cross(rAWorld, jALin.r1), cross(rAWorld, jALin.r2));
+            Mat3 jBAng = Mat3(cross(rBWorld, jBLin.r0), cross(rBWorld, jBLin.r1), cross(rBWorld, jBLin.r2));
+
+            Mat3 K = Mat3::diag3(ct.penalty);
+            float3 C_ct = ct.C0 * (1.0f - alpha)
+                + jALin.mul(dqALin) + jBLin.mul(dqBLin)
+                + jAAng.mul(dqAAng) + jBAng.mul(dqBAng);
+            float3 F_ct = K.mul(C_ct) + ct.lambda;
+
+            // Clamp normal force (compression only)
+            F_ct[0] = min(F_ct[0], 0.0f);
+            // Friction cone
+            float bounds = abs(F_ct[0]) * m.friction;
+            float frictionScale = length(float2(F_ct[1], F_ct[2]));
+            if (frictionScale > bounds && frictionScale > 0.0f) {
+                F_ct[1] *= bounds / frictionScale;
+                F_ct[2] *= bounds / frictionScale;
+            }
+
+            Mat3 jLin2 = isBodyA ? jALin : jBLin;
+            Mat3 jAng2 = isBodyA ? jAAng : jBAng;
+            Mat3 jLinT2 = mat3_transpose(jLin2);
+            Mat3 jAngT2 = mat3_transpose(jAng2);
+            Mat3 jAngTk2 = mat3_mul(jAngT2, K);
+
+            lhsLin = lhsLin + mat3_mul(mat3_mul(jLinT2, K), jLin2);
+            lhsAng = lhsAng + mat3_mul(jAngTk2, jAng2);
+            lhsCross = lhsCross + mat3_mul(jAngTk2, jLin2);
+            rhsLin = rhsLin + jLinT2.mul(F_ct);
+            rhsAng = rhsAng + jAngT2.mul(F_ct);
+        }
+    }
+
+    // ── Solve 6×6 system ──
+    float3 dxLin, dxAng;
+    solve_6x6(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, dxLin, dxAng);
+
+    bool dxValid = (abs(dxLin.x) < 1e10f && abs(dxLin.y) < 1e10f && abs(dxLin.z) < 1e10f &&
+                    abs(dxAng.x) < 1e10f && abs(dxAng.y) < 1e10f && abs(dxAng.z) < 1e10f);
+    if (dxValid) {
+        body.positionLin += dxLin;
+        body.positionAng = quat_add_angular(body.positionAng, dxAng);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 4: Dual Update (penalty adaptation)
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_dual_update_joints(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device AVBDGPUJoint *joints [[buffer(1)]],
+    constant AVBDGPUSolverParams &params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(params.jointCount)) return;
+
+    device AVBDGPUJoint &j = joints[tid];
+    if (j.broken) return;
+
+    float alpha = params.alpha;
+
+    // Linear
+    if (length_squared(j.penaltyLin) > 0.0f) {
+        float3 posA, rA_local = j.rA;
+        float4 quatA;
+        if (j.bodyA >= 0) {
+            posA = bodies[j.bodyA].positionLin;
+            quatA = bodies[j.bodyA].positionAng;
+        } else {
+            posA = float3(0);
+            quatA = float4(0, 0, 0, 1);
+        }
+
+        float3 pA = xform(posA, quatA, rA_local);
+        float3 pB = xform(bodies[j.bodyB].positionLin, bodies[j.bodyB].positionAng, j.rB);
+        float3 C = pA - pB;
+
+        if (j.stiffnessLin >= 1e30f) {
+            C -= j.C0Lin * alpha;
+            Mat3 K = Mat3::diag3(j.penaltyLin);
+            j.lambdaLin = K.mul(C) + j.lambdaLin;
+        }
+
+        j.penaltyLin = min_vec(j.penaltyLin + abs_vec(C) * params.betaLin,
+                               min(j.stiffnessLin, params.penaltyMax));
+    }
+
+    // Angular
+    if (length_squared(j.penaltyAng) > 0.0f) {
+        float4 quatA2 = (j.bodyA >= 0) ? bodies[j.bodyA].positionAng : float4(0, 0, 0, 1);
+        float3 C = quat_delta(quatA2, bodies[j.bodyB].positionAng) * j.torqueArm;
+
+        if (j.stiffnessAng >= 1e30f) {
+            C -= j.C0Ang * alpha;
+            Mat3 K = Mat3::diag3(j.penaltyAng);
+            j.lambdaAng = K.mul(C) + j.lambdaAng;
+        }
+
+        j.penaltyAng = min_vec(j.penaltyAng + abs_vec(C) * params.betaAng,
+                               min(j.stiffnessAng, params.penaltyMax));
+    }
+
+    // Fracture check
+    if (j.fracture < 1e30f && length_squared(j.lambdaAng) > j.fracture * j.fracture) {
+        j.penaltyLin = float3(0);
+        j.penaltyAng = float3(0);
+        j.lambdaLin = float3(0);
+        j.lambdaAng = float3(0);
+        j.broken = 1;
+    }
+}
+
+kernel void avbd_dual_update_manifolds(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device AVBDGPUManifold *manifolds [[buffer(1)]],
+    device int *activeManifoldIndices [[buffer(2)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(3)]],
+    device AVBDGPUContact *allContacts [[buffer(4)]],
+    constant AVBDGPUSolverParams &params [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int activeManifoldCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    if (tid >= uint(activeManifoldCount)) return;
+
+    device AVBDGPUManifold &m = manifolds[activeManifoldIndices[tid]];
+
+    device AVBDGPUBody &bA = bodies[m.bodyA];
+    device AVBDGPUBody &bB = bodies[m.bodyB];
+
+    Mat3 basis(m.basisR0, m.basisR1, m.basisR2);
+
+    float3 dqALin = bA.positionLin - bA.initialLin;
+    float3 dqAAng = quat_delta(bA.positionAng, bA.initialAng);
+    float3 dqBLin = bB.positionLin - bB.initialLin;
+    float3 dqBAng = quat_delta(bB.positionAng, bB.initialAng);
+
+    float alpha = params.alpha;
+
+    for (int ci = 0; ci < m.contactCount; ci++) {
+        device AVBDGPUContact &ct = allContacts[m.contactBaseIndex + ci];
+        if (!ct.active) continue;
+
+        float3 rAWorld = quat_act(bA.positionAng, ct.rA);
+        float3 rBWorld = quat_act(bB.positionAng, ct.rB);
+
+        Mat3 jALin = basis;
+        Mat3 jBLin = basis * (-1.0f);
+        Mat3 jAAng = Mat3(cross(rAWorld, jALin.r0), cross(rAWorld, jALin.r1), cross(rAWorld, jALin.r2));
+        Mat3 jBAng = Mat3(cross(rBWorld, jBLin.r0), cross(rBWorld, jBLin.r1), cross(rBWorld, jBLin.r2));
+
+        Mat3 K = Mat3::diag3(ct.penalty);
+        float3 C = ct.C0 * (1.0f - alpha)
+            + jALin.mul(dqALin) + jBLin.mul(dqBLin)
+            + jAAng.mul(dqAAng) + jBAng.mul(dqBAng);
+        float3 F = K.mul(C) + ct.lambda;
+
+        F[0] = min(F[0], 0.0f);
+        float bounds = abs(F[0]) * m.friction;
+        float frictionScale = length(float2(F[1], F[2]));
+        if (frictionScale > bounds && frictionScale > 0.0f) {
+            F[1] *= bounds / frictionScale;
+            F[2] *= bounds / frictionScale;
+        }
+
+        ct.lambda = F;
+
+        if (F[0] < 0.0f) {
+            ct.penalty[0] = min(ct.penalty[0] + params.betaLin * abs(C[0]), params.penaltyMax);
+        }
+        if (frictionScale <= bounds) {
+            ct.penalty[1] = min(ct.penalty[1] + params.betaLin * abs(C[1]), params.penaltyMax);
+            ct.penalty[2] = min(ct.penalty[2] + params.betaLin * abs(C[2]), params.penaltyMax);
+            ct.stick = (length(float2(C[1], C[2])) < params.stickThreshold) ? 1 : 0;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 5: Finalize (velocity update)
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_finalize(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    constant AVBDGPUSolverParams &params [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(params.bodyCount)) return;
+
+    device AVBDGPUBody &b = bodies[tid];
+    float dt = params.dt;
+
+    b.prevVelocityLin = b.velocityLin;
+    if (b.mass > 0.0f) {
+        b.velocityLin = (b.positionLin - b.initialLin) / dt;
+        b.velocityAng = quat_delta(b.positionAng, b.initialAng) / dt;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 5b: Contact Warmstart
+//   Matches newly detected contacts with previous-frame contacts
+//   by (bodyA, bodyB, featureKey) and copies penalty/lambda/stick.
+// ─────────────────────────────────────────────────────────────
+kernel void avbd_warmstart_contacts(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device AVBDGPUManifold *manifolds [[buffer(1)]],
+    device AVBDGPUContact *contacts [[buffer(2)]],
+    device int *activeManifoldIndices [[buffer(3)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(4)]],
+    device AVBDGPUManifold *prevManifolds [[buffer(5)]],
+    device AVBDGPUContact *prevContacts [[buffer(6)]],
+    device int *prevActiveManifoldIndices [[buffer(7)]],
+    device AVBDGPUActiveManifoldListState *prevActiveManifoldState [[buffer(8)]],
+    constant AVBDGPUSolverParams &params [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int activeCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    if (tid >= uint(activeCount)) return;
+
+    int manifoldIdx = activeManifoldIndices[tid];
+    device AVBDGPUManifold &m = manifolds[manifoldIdx];
+    if (!m.active || m.contactCount == 0) return;
+
+    // Search previous frame for matching manifold (same body pair)
+    int prevActiveCount = atomic_load_explicit(&prevActiveManifoldState[0].count, memory_order_relaxed);
+    int prevMatchIdx = -1;
+    for (int pi = 0; pi < prevActiveCount; pi++) {
+        int prevMIdx = prevActiveManifoldIndices[pi];
+        device AVBDGPUManifold &pm = prevManifolds[prevMIdx];
+        if (pm.bodyA == m.bodyA && pm.bodyB == m.bodyB) {
+            prevMatchIdx = prevMIdx;
+            break;
+        }
+    }
+    if (prevMatchIdx < 0) return;
+
+    device AVBDGPUManifold &pm = prevManifolds[prevMatchIdx];
+    Mat3 basis(m.basisR0, m.basisR1, m.basisR2);
+
+    for (int ci = 0; ci < m.contactCount; ci++) {
+        device AVBDGPUContact &ct = contacts[m.contactBaseIndex + ci];
+        if (!ct.active) continue;
+
+        for (int pci = 0; pci < pm.contactCount; pci++) {
+            device AVBDGPUContact &pct = prevContacts[pm.contactBaseIndex + pci];
+            if (pct.featureKey != ct.featureKey || !pct.active) continue;
+
+            // Match found — copy warmstart data with decay
+            ct.penalty = clamp(pct.penalty * params.gamma,
+                               float3(params.penaltyMin),
+                               float3(params.penaltyMax));
+            ct.lambda = pct.lambda * params.alpha * params.gamma;
+
+            if (pct.stick) {
+                ct.rA = pct.rA;
+                ct.rB = pct.rB;
+                ct.stick = pct.stick;
+                // Recompute C0 with old rA/rB and current body positions
+                device AVBDGPUBody &bA = bodies[m.bodyA];
+                device AVBDGPUBody &bB = bodies[m.bodyB];
+                float3 xA = quat_act(bA.positionAng, ct.rA) + bA.positionLin;
+                float3 xB = quat_act(bB.positionAng, ct.rB) + bB.positionLin;
+                float3 diff = xA - xB;
+                ct.C0 = float3(dot(basis.r0, diff), dot(basis.r1, diff), dot(basis.r2, diff))
+                       + float3(params.collisionMargin, 0, 0);
+            }
+            break;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 6: Write instance transforms for rendering
+// ─────────────────────────────────────────────────────────────
+constant int AVBD_NIL_COLOR_GROUP = (-2147483647 - 1);
+
+inline float4 avbd_default_render_color_for_mass(float mass)
+{
+    return mass <= 0.0f ? float4(0.47f, 0.50f, 0.47f, 1.0f)
+                        : float4(0.72f, 0.80f, 0.92f, 1.0f);
+}
+
+inline float4 avbd_render_color_for_group(int colorGroup)
+{
+    int paletteIndex = colorGroup % 5;
+    if (paletteIndex < 0) {
+        paletteIndex += 5;
+    }
+
+    switch (paletteIndex) {
+        case 0: return float4(0.93f, 0.42f, 0.39f, 1.0f);
+        case 1: return float4(0.97f, 0.71f, 0.30f, 1.0f);
+        case 2: return float4(0.48f, 0.79f, 0.51f, 1.0f);
+        case 3: return float4(0.35f, 0.73f, 0.92f, 1.0f);
+        default: return float4(0.63f, 0.52f, 0.90f, 1.0f);
+    }
+}
+
+inline float4 avbd_resolve_render_color(
+    float4 explicitRenderColor,
+    int explicitColorGroup,
+    int computedColorGroup,
+    float mass)
+{
+    if (explicitRenderColor.w >= 0.0f) {
+        return explicitRenderColor;
+    }
+    if (explicitColorGroup != AVBD_NIL_COLOR_GROUP) {
+        return avbd_render_color_for_group(explicitColorGroup);
+    }
+    if (mass <= 0.0f) {
+        return avbd_default_render_color_for_mass(mass);
+    }
+    return avbd_render_color_for_group(computedColorGroup);
+}
+
+kernel void avbd_write_instances(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device InstanceUniforms *instances [[buffer(1)]],
+    device const float4 *renderColors [[buffer(2)]],
+    device const int *renderColorGroups [[buffer(3)]],
+    device const int *bodyColors [[buffer(4)]],
+    constant AVBDGPUSolverParams &params [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(params.bodyCount)) return;
+
+    device AVBDGPUBody &b = bodies[tid];
+
+    // Build model matrix = Translation * Rotation * Scale
+    float4 q = normalize(b.positionAng);
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float xx = x*x, yy = y*y, zz = z*z;
+    float xy = x*y, xz = x*z, yz = y*z;
+    float wx = w*x, wy = w*y, wz = w*z;
+
+    float3 sz = b.size;
+    float4 c0 = float4((1 - 2*(yy+zz)) * sz.x, (2*(xy+wz)) * sz.x, (2*(xz-wy)) * sz.x, 0);
+    float4 c1 = float4((2*(xy-wz)) * sz.y, (1 - 2*(xx+zz)) * sz.y, (2*(yz+wx)) * sz.y, 0);
+    float4 c2 = float4((2*(xz+wy)) * sz.z, (2*(yz-wx)) * sz.z, (1 - 2*(xx+yy)) * sz.z, 0);
+    float4 c3 = float4(b.positionLin, 1.0f);
+
+    instances[tid].modelMatrix = float4x4(c0, c1, c2, c3);
+    instances[tid].renderColor = avbd_resolve_render_color(
+        renderColors[tid],
+        renderColorGroups[tid],
+        bodyColors[tid],
+        b.mass
+    );
+    instances[tid].shapeParams = float4(float(b.renderShape),
+                                        b.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS ? torus_major_radius(b) : 0.0f,
+                                        b.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS ? torus_minor_radius(b) : 0.0f,
+                                        0.0f);
+}
