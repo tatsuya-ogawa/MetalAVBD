@@ -13,8 +13,6 @@ import simd
 private let SWIFT_AVBD_MAX_CONTACTS_PER_PAIR = Int(AVBD_MAX_CONTACTS_PER_PAIR)
 private let SWIFT_AVBD_MAX_CONTACTS_PER_PAIR_BURST = SWIFT_AVBD_MAX_CONTACTS_PER_PAIR * 2
 private let SWIFT_AVBD_MAX_CONSTRAINTS_PER_BODY = Int(AVBD_MAX_CONSTRAINTS_PER_BODY)
-private let SWIFT_AVBD_BROADPHASE_THREADGROUP_SIZE = Int(AVBD_BROADPHASE_THREADGROUP_SIZE)
-private let SWIFT_AVBD_DERIVED_THREADGROUP_SIZE = Int(AVBD_DERIVED_THREADGROUP_SIZE)
 private let gpuCollisionMargin: Float = 0.01
 private let gpuPenaltyMin: Float = 1.0
 private let gpuPenaltyMax: Float = 10_000_000_000.0
@@ -61,8 +59,7 @@ final class AVBDGPUSolver {
     private let broadphaseFullPSO: MTLComputePipelineState
     private let broadphasePartialPSO: MTLComputePipelineState
     private let prepareBroadphaseIndirectPSO: MTLComputePipelineState
-    private let processBroadphaseDerivedPSO: MTLComputePipelineState
-    private let prepareDerivedPairsIndirectPSO: MTLComputePipelineState
+    private let buildPrimitiveManifoldsPSO: MTLComputePipelineState
     private let prepareActiveManifoldsIndirectPSO: MTLComputePipelineState
     private let buildAdjacencyConstraintsPSO: MTLComputePipelineState
     private let buildAdjacencyManifoldsPSO: MTLComputePipelineState
@@ -121,7 +118,6 @@ final class AVBDGPUSolver {
     private var adjacencyBuffer: MTLBuffer
     private var contactBuffer: MTLBuffer
     private var contactAllocatorBuffer: MTLBuffer
-    private var manifoldAllocatorBuffer: MTLBuffer
     private var recentPairIndexBuffers: [MTLBuffer]
     private var recentPairStateBuffers: [MTLBuffer]
     private var recentPairIndirectBuffers: [MTLBuffer]
@@ -216,8 +212,7 @@ final class AVBDGPUSolver {
               let bpf = makePSO("avbd_broadphase_full"),
               let bpp = makePSO("avbd_broadphase_partial"),
               let pbi = makePSO("avbd_prepare_broadphase_indirect"),
-              let pbd = makePSO("avbd_process_broadphase_pair_derived"),
-              let pdi = makePSO("avbd_prepare_derived_pairs_indirect"),
+              let bpm = makePSO("avbd_build_primitive_manifolds"),
               let pai = makePSO("avbd_prepare_active_manifolds_indirect"),
               let bac = makePSO("avbd_build_adjacency_constraints"),
               let bam = makePSO("avbd_build_adjacency_manifolds"),
@@ -235,8 +230,7 @@ final class AVBDGPUSolver {
         broadphaseFullPSO = bpf
         broadphasePartialPSO = bpp
         prepareBroadphaseIndirectPSO = pbi
-        processBroadphaseDerivedPSO = pbd
-        prepareDerivedPairsIndirectPSO = pdi
+        buildPrimitiveManifoldsPSO = bpm
         prepareActiveManifoldsIndirectPSO = pai
         buildAdjacencyConstraintsPSO = bac
         buildAdjacencyManifoldsPSO = bam
@@ -341,7 +335,6 @@ final class AVBDGPUSolver {
         let adjBufSize = max(MemoryLayout<AVBDGPUAdjacency>.stride * bodyCapacity, 16)
         let contactBufSize = max(MemoryLayout<AVBDGPUContact>.stride * maxCollisions * SWIFT_AVBD_MAX_CONTACTS_PER_PAIR, 16)
         let contactAllocatorBufSize = max(MemoryLayout<AVBDGPUContactAllocator>.stride, 16)
-        let manifoldAllocatorBufSize = max(MemoryLayout<AVBDGPUManifoldAllocator>.stride, 16)
         let recentPairIndexBufSize = max(MemoryLayout<Int32>.stride * recentPairCapacity, 16)
         let recentPairStateBufSize = max(MemoryLayout<AVBDGPURecentPairCacheState>.stride, 16)
         let recentPairIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
@@ -363,7 +356,6 @@ final class AVBDGPUSolver {
               let ab = device.makeBuffer(length: adjBufSize, options: .storageModeShared),
               let ctb = device.makeBuffer(length: contactBufSize, options: .storageModeShared),
               let cab = device.makeBuffer(length: contactAllocatorBufSize, options: .storageModeShared),
-              let mab = device.makeBuffer(length: manifoldAllocatorBufSize, options: .storageModeShared),
               let rpi0 = device.makeBuffer(length: recentPairIndexBufSize, options: .storageModeShared),
               let rpi1 = device.makeBuffer(length: recentPairIndexBufSize, options: .storageModeShared),
               let rps0 = device.makeBuffer(length: recentPairStateBufSize, options: .storageModeShared),
@@ -394,7 +386,6 @@ final class AVBDGPUSolver {
         adjacencyBuffer = ab
         contactBuffer = ctb
         contactAllocatorBuffer = cab
-        manifoldAllocatorBuffer = mab
         recentPairIndexBuffers = [rpi0, rpi1]
         recentPairStateBuffers = [rps0, rps1]
         recentPairIndirectBuffers = [rpd0, rpd1]
@@ -416,9 +407,6 @@ final class AVBDGPUSolver {
 
         let allocatorPtr = contactAllocatorBuffer.contents().bindMemory(to: AVBDGPUContactAllocator.self, capacity: 1)
         allocatorPtr.pointee = AVBDGPUContactAllocator(nextContactIndex: Int32(0), contactCapacity: Int32(contactCapacity))
-
-        let manifoldAllocatorPtr = manifoldAllocatorBuffer.contents().bindMemory(to: AVBDGPUManifoldAllocator.self, capacity: 1)
-        manifoldAllocatorPtr.pointee = AVBDGPUManifoldAllocator(nextManifoldIndex: Int32(0), manifoldCapacity: Int32(maxCollisions))
 
         for stateBuffer in recentPairStateBuffers {
             let statePtr = stateBuffer.contents().bindMemory(to: AVBDGPURecentPairCacheState.self, capacity: 1)
@@ -616,13 +604,15 @@ final class AVBDGPUSolver {
         let bodyThreads = MTLSize(width: max(bodyCount, 1), height: 1, depth: 1)
         let jointThreads = MTLSize(width: max(cpuJoints.count, 1), height: 1, depth: 1)
         let totalPairCount = bodyCount * (bodyCount - 1) / 2
+        let broadphaseWidth = broadphaseFullPSO.threadExecutionWidth
         let broadphaseFullThreadgroupCount = MTLSize(
-            width: max((max(totalPairCount, 1) + SWIFT_AVBD_BROADPHASE_THREADGROUP_SIZE - 1) / SWIFT_AVBD_BROADPHASE_THREADGROUP_SIZE, 1),
+            width: max((max(totalPairCount, 1) + broadphaseWidth - 1) / broadphaseWidth, 1),
             height: 1,
             depth: 1
         )
         let adjacencyConstraintThreads = MTLSize(width: max(cpuJoints.count, cpuSprings.count, 1), height: 1, depth: 1)
-        let threadgroupSize = MTLSize(width: SWIFT_AVBD_BROADPHASE_THREADGROUP_SIZE, height: 1, depth: 1)
+        let threadgroupSize = MTLSize(width: broadphaseWidth, height: 1, depth: 1)
+        let derivedThreadgroupSize = MTLSize(width: buildPrimitiveManifoldsPSO.threadExecutionWidth, height: 1, depth: 1)
         let currentRecentPairCount = Int(currentRecentPairStateBuffer.contents().bindMemory(to: AVBDGPURecentPairCacheState.self, capacity: 1).pointee.count)
         let shouldRunFullBroadphase = broadphaseFullRefreshStepCount <= 0
             || forceFullBroadphase
@@ -636,9 +626,8 @@ final class AVBDGPUSolver {
         encoder.setBuffer(contactAllocatorBuffer, offset: 0, index: 1)
         encoder.setBuffer(nextRecentPairStateBuffer, offset: 0, index: 2)
         encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 3)
-        encoder.setBuffer(manifoldAllocatorBuffer, offset: 0, index: 4)
-        encoder.setBuffer(derivedPairStateBuffer, offset: 0, index: 5)
-        encoder.setBuffer(paramsBuffer, offset: 0, index: 6)
+        encoder.setBuffer(derivedPairStateBuffer, offset: 0, index: 4)
+        encoder.setBuffer(paramsBuffer, offset: 0, index: 5)
         encoder.dispatchThreads(bodyThreads, threadsPerThreadgroup: threadgroupSize)
 
         if bodyCount > 1 {
@@ -646,30 +635,22 @@ final class AVBDGPUSolver {
                 encoder.setComputePipelineState(broadphaseFullPSO)
                 encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
                 encoder.setBuffer(exclusionBuffer, offset: 0, index: 1)
-                encoder.setBuffer(manifoldAllocatorBuffer, offset: 0, index: 2)
-                encoder.setBuffer(manifoldBuffer, offset: 0, index: 3)
-                encoder.setBuffer(contactBuffer, offset: 0, index: 4)
-                encoder.setBuffer(contactAllocatorBuffer, offset: 0, index: 5)
-                encoder.setBuffer(nextRecentPairIndexBuffer, offset: 0, index: 6)
-                encoder.setBuffer(nextRecentPairStateBuffer, offset: 0, index: 7)
-                encoder.setBuffer(activeManifoldIndexBuffer, offset: 0, index: 8)
-                encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 9)
-                encoder.setBuffer(paramsBuffer, offset: 0, index: 10)
+                encoder.setBuffer(nextRecentPairIndexBuffer, offset: 0, index: 2)
+                encoder.setBuffer(nextRecentPairStateBuffer, offset: 0, index: 3)
+                encoder.setBuffer(derivedPairCandidateBuffer, offset: 0, index: 4)
+                encoder.setBuffer(derivedPairStateBuffer, offset: 0, index: 5)
+                encoder.setBuffer(paramsBuffer, offset: 0, index: 6)
                 encoder.dispatchThreadgroups(broadphaseFullThreadgroupCount, threadsPerThreadgroup: threadgroupSize)
             } else {
                 encoder.setComputePipelineState(broadphasePartialPSO)
                 encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
                 encoder.setBuffer(currentRecentPairIndexBuffer, offset: 0, index: 1)
                 encoder.setBuffer(currentRecentPairStateBuffer, offset: 0, index: 2)
-                encoder.setBuffer(manifoldAllocatorBuffer, offset: 0, index: 3)
-                encoder.setBuffer(manifoldBuffer, offset: 0, index: 4)
-                encoder.setBuffer(contactBuffer, offset: 0, index: 5)
-                encoder.setBuffer(contactAllocatorBuffer, offset: 0, index: 6)
-                encoder.setBuffer(nextRecentPairIndexBuffer, offset: 0, index: 7)
-                encoder.setBuffer(nextRecentPairStateBuffer, offset: 0, index: 8)
-                encoder.setBuffer(activeManifoldIndexBuffer, offset: 0, index: 9)
-                encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 10)
-                encoder.setBuffer(paramsBuffer, offset: 0, index: 11)
+                encoder.setBuffer(nextRecentPairIndexBuffer, offset: 0, index: 3)
+                encoder.setBuffer(nextRecentPairStateBuffer, offset: 0, index: 4)
+                encoder.setBuffer(derivedPairCandidateBuffer, offset: 0, index: 5)
+                encoder.setBuffer(derivedPairStateBuffer, offset: 0, index: 6)
+                encoder.setBuffer(paramsBuffer, offset: 0, index: 7)
                 encoder.dispatchThreadgroups(
                     indirectBuffer: currentRecentPairIndirectBuffer,
                     indirectBufferOffset: 0,
@@ -682,7 +663,25 @@ final class AVBDGPUSolver {
         encoder.setComputePipelineState(prepareBroadphaseIndirectPSO)
         encoder.setBuffer(nextRecentPairStateBuffer, offset: 0, index: 0)
         encoder.setBuffer(nextRecentPairIndirectBuffer, offset: 0, index: 1)
+        encoder.setBuffer(derivedPairStateBuffer, offset: 0, index: 2)
+        encoder.setBuffer(derivedPairIndirectBuffer, offset: 0, index: 3)
         encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+
+        encoder.setComputePipelineState(buildPrimitiveManifoldsPSO)
+        encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
+        encoder.setBuffer(derivedPairCandidateBuffer, offset: 0, index: 1)
+        encoder.setBuffer(derivedPairStateBuffer, offset: 0, index: 2)
+        encoder.setBuffer(manifoldBuffer, offset: 0, index: 3)
+        encoder.setBuffer(contactBuffer, offset: 0, index: 4)
+        encoder.setBuffer(contactAllocatorBuffer, offset: 0, index: 5)
+        encoder.setBuffer(activeManifoldIndexBuffer, offset: 0, index: 6)
+        encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 7)
+        encoder.setBuffer(paramsBuffer, offset: 0, index: 8)
+        encoder.dispatchThreadgroups(
+            indirectBuffer: derivedPairIndirectBuffer,
+            indirectBufferOffset: 0,
+            threadsPerThreadgroup: derivedThreadgroupSize
+        )
 
         encoder.setComputePipelineState(prepareActiveManifoldsIndirectPSO)
         encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 0)
@@ -1078,7 +1077,6 @@ final class AVBDGPUSolver {
             bodyCount: Int32(bodyCount),
             jointCount: Int32(cpuJoints.count),
             springCount: Int32(cpuSprings.count),
-            manifoldCapacity: Int32(maxCollisions),
             collisionMargin: gpuCollisionMargin,
             cacheMargin: effectiveCacheMargin,
             cacheTimeHorizon: cacheTimeHorizon,
