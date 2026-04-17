@@ -226,43 +226,9 @@ static void upper_triangle_pair(uint tid, int n, thread int &outA, thread int &o
     outB = j;
 }
 
-// Reserve a single manifold slot from the manifold allocator. Returns -1 if full.
-static int reserve_manifold_slot(device AVBDGPUManifoldAllocator &allocator) {
-    int expected = atomic_load_explicit(&allocator.nextManifoldIndex, memory_order_relaxed);
-    while (true) {
-        if (expected >= allocator.manifoldCapacity) return -1;
-        if (atomic_compare_exchange_weak_explicit(&allocator.nextManifoldIndex,
-                                                  &expected,
-                                                  expected + 1,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-            return expected;
-        }
-    }
-}
-
-// Reserve a contiguous range of manifold slots. Returns number granted.
-static int reserve_manifold_range(device AVBDGPUManifoldAllocator &allocator, int requestedCount, thread int &baseIndex) {
-    int expected = atomic_load_explicit(&allocator.nextManifoldIndex, memory_order_relaxed);
-    while (true) {
-        int remaining = allocator.manifoldCapacity - expected;
-        if (remaining <= 0) return 0;
-        int grantedCount = min(requestedCount, remaining);
-        int desired = expected + grantedCount;
-        if (atomic_compare_exchange_weak_explicit(&allocator.nextManifoldIndex,
-                                                  &expected,
-                                                  desired,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-            baseIndex = expected;
-            return grantedCount;
-        }
-    }
-}
-
 // Check if bodyB is in bodyA's collision exclusion list.
 static bool is_excluded(device AVBDGPUCollisionExclusion *exclusions, int bodyA, int bodyB) {
-    int countA = atomic_load_explicit(&exclusions[bodyA].excludeCount, memory_order_relaxed);
+    int countA = exclusions[bodyA].excludeCount;
     for (int i = 0; i < countA; i++) {
         if (exclusions[bodyA].excludeIndices[i] == bodyB) return true;
     }
@@ -270,66 +236,39 @@ static bool is_excluded(device AVBDGPUCollisionExclusion *exclusions, int bodyA,
 }
 
 static int reserve_contact_range(device AVBDGPUContactAllocator &allocator, int requestedCount, thread int &baseIndex) {
-    int expected = atomic_load_explicit(&allocator.nextContactIndex, memory_order_relaxed);
-    while (true) {
-        int remaining = allocator.contactCapacity - expected;
-        if (remaining <= 0) {
-            return 0;
-        }
-
-        int grantedCount = min(requestedCount, remaining);
-        int desired = expected + grantedCount;
-        if (atomic_compare_exchange_weak_explicit(&allocator.nextContactIndex,
-                                                  &expected,
-                                                  desired,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-            baseIndex = expected;
-            return grantedCount;
-        }
-    }
+    if (requestedCount <= 0) return 0;
+    int index = atomic_fetch_add_explicit(&allocator.nextContactIndex, requestedCount, memory_order_relaxed);
+    if (index >= allocator.contactCapacity) return 0;
+    int grantedCount = min(requestedCount, allocator.contactCapacity - index);
+    baseIndex = index;
+    return grantedCount;
 }
 
 static int reserve_recent_pair_range(device AVBDGPURecentPairCacheState &state, int requestedCount, thread int &baseIndex) {
-    int expected = atomic_load_explicit(&state.count, memory_order_relaxed);
-    while (true) {
-        int remaining = state.capacity - expected;
-        if (remaining <= 0) {
-            return 0;
-        }
+    if (requestedCount <= 0) return 0;
+    int index = atomic_fetch_add_explicit(&state.count, requestedCount, memory_order_relaxed);
+    if (index >= state.capacity) return 0;
+    int grantedCount = min(requestedCount, state.capacity - index);
+    baseIndex = index;
+    return grantedCount;
+}
 
-        int grantedCount = min(requestedCount, remaining);
-        int desired = expected + grantedCount;
-        if (atomic_compare_exchange_weak_explicit(&state.count,
-                                                  &expected,
-                                                  desired,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-            baseIndex = expected;
-            return grantedCount;
-        }
-    }
+static int reserve_derived_pair_range(device AVBDGPUDerivedPairCandidateState &state, int requestedCount, thread int &baseIndex) {
+    if (requestedCount <= 0) return 0;
+    int index = atomic_fetch_add_explicit(&state.count, requestedCount, memory_order_relaxed);
+    if (index >= state.capacity) return 0;
+    int grantedCount = min(requestedCount, state.capacity - index);
+    baseIndex = index;
+    return grantedCount;
 }
 
 static int reserve_active_manifold_range(device AVBDGPUActiveManifoldListState &state, int requestedCount, thread int &baseIndex) {
-    int expected = atomic_load_explicit(&state.count, memory_order_relaxed);
-    while (true) {
-        int remaining = state.capacity - expected;
-        if (remaining <= 0) {
-            return 0;
-        }
-
-        int grantedCount = min(requestedCount, remaining);
-        int desired = expected + grantedCount;
-        if (atomic_compare_exchange_weak_explicit(&state.count,
-                                                  &expected,
-                                                  desired,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
-            baseIndex = expected;
-            return grantedCount;
-        }
-    }
+    if (requestedCount <= 0) return 0;
+    int index = atomic_fetch_add_explicit(&state.count, requestedCount, memory_order_relaxed);
+    if (index >= state.capacity) return 0;
+    int grantedCount = min(requestedCount, state.capacity - index);
+    baseIndex = index;
+    return grantedCount;
 }
 
 static float abs_dot(float3 a, float3 b) {
@@ -1176,13 +1115,10 @@ static bool collide_bodies_gpu(device const AVBDGPUBody &bodyA,
 }
 
 static bool reserve_adjacency_slot(device atomic_int *count, thread int &slot) {
-    int expected = atomic_load_explicit(count, memory_order_relaxed);
-    while (expected < AVBD_MAX_CONSTRAINTS_PER_BODY) {
-        int desired = expected + 1;
-        if (atomic_compare_exchange_weak_explicit(count, &expected, desired, memory_order_relaxed, memory_order_relaxed)) {
-            slot = expected;
-            return true;
-        }
+    int expected = atomic_fetch_add_explicit(count, 1, memory_order_relaxed);
+    if (expected < AVBD_MAX_CONSTRAINTS_PER_BODY) {
+        slot = expected;
+        return true;
     }
     return false;
 }
@@ -1299,16 +1235,14 @@ kernel void avbd_reset_adjacency(
     device AVBDGPUContactAllocator *contactAllocator [[buffer(1)]],
     device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(2)]],
     device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(3)]],
-    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(4)]],
-    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(5)]],
-    constant AVBDGPUSolverParams &params [[buffer(6)]],
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(4)]],
+    constant AVBDGPUSolverParams &params [[buffer(5)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid == 0) {
         atomic_store_explicit(&contactAllocator[0].nextContactIndex, 0, memory_order_relaxed);
         atomic_store_explicit(&nextRecentPairState[0].count, 0, memory_order_relaxed);
         atomic_store_explicit(&activeManifoldState[0].count, 0, memory_order_relaxed);
-        atomic_store_explicit(&manifoldAllocator[0].nextManifoldIndex, 0, memory_order_relaxed);
         atomic_store_explicit(&derivedPairState[0].count, 0, memory_order_relaxed);
     }
 
@@ -1320,99 +1254,38 @@ kernel void avbd_reset_adjacency(
     atomic_store_explicit(&adj.manifoldCount, 0, memory_order_relaxed);
 }
 
-static void process_broadphase_pair_derived(
-    int bodyIdxA,
-    int bodyIdxB,
-    int manifoldSlot,
-    device AVBDGPUBody *bodies,
-    device AVBDGPUManifold *manifolds,
-    device AVBDGPUContact *allContacts,
-    device AVBDGPUContactAllocator &contactAllocator,
-    constant AVBDGPUSolverParams &params,
-    thread bool &shouldEmitActiveManifold)
-{
-    device AVBDGPUBody &bodyA = bodies[bodyIdxA];
-    device AVBDGPUBody &bodyB = bodies[bodyIdxB];
-    device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
 
-    manifold.bodyA = bodyIdxA;
-    manifold.bodyB = bodyIdxB;
-    manifold.contactCount = 0;
-    manifold.contactBaseIndex = -1;
-    manifold.active = 0;
-    manifold.friction = sqrt(bodyA.friction * bodyB.friction);
-    manifold.basisR0 = float3(1, 0, 0);
-    manifold.basisR1 = float3(0, 1, 0);
-    manifold.basisR2 = float3(0, 0, 1);
-
-    float3 dp = bodyA.positionLin - bodyB.positionLin;
-    float radiusA = body_radius(bodyA, params);
-    float radiusB = body_radius(bodyB, params);
-    float radius = radiusA + radiusB;
-    float distSq = length_squared(dp);
-
-    if (distSq > radius * radius) {
-        return;
-    }
-
-    AVBDGPUContactBuilderMetal builder;
-    builder.count = 0;
-    Mat3 basis = Mat3::identity();
-    if (!collide_bodies_gpu(bodyA, bodyB, builder, basis, params, params.collisionMargin)) {
-        return;
-    }
-
-    manifold.basisR0 = basis.r0;
-    manifold.basisR1 = basis.r1;
-    manifold.basisR2 = basis.r2;
-    int contactBaseIndex = -1;
-    manifold.contactCount = reserve_contact_range(contactAllocator, builder.count, contactBaseIndex);
-    manifold.contactBaseIndex = contactBaseIndex;
-    manifold.active = (manifold.contactCount > 0) ? 1 : 0;
-    shouldEmitActiveManifold = manifold.active != 0;
-    for (int i = 0; i < manifold.contactCount; i++) {
-        allContacts[manifold.contactBaseIndex + i] = builder.contacts[i];
-    }
-}
+static inline void compact_broadphase_batch(
+    bool shouldCachePair,
+    int encodedPair,
+    bool shouldProcessDerivedPair,
+    device int *nextRecentPairIndices,
+    device AVBDGPURecentPairCacheState *nextRecentPairState,
+    device int *derivedPairIndices,
+    device AVBDGPUDerivedPairCandidateState *derivedPairState,
+    uint lid,
+    uint simd_size);
 
 kernel void avbd_broadphase_full(
     device AVBDGPUBody *bodies [[buffer(0)]],
     device AVBDGPUCollisionExclusion *exclusions [[buffer(1)]],
-    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(2)]],
-    device AVBDGPUManifold *manifolds [[buffer(3)]],
-    device AVBDGPUContact *allContacts [[buffer(4)]],
-    device AVBDGPUContactAllocator *contactAllocator [[buffer(5)]],
-    device int *nextRecentPairIndices [[buffer(6)]],
-    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(7)]],
-    device int *activeManifoldIndices [[buffer(8)]],
-    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(9)]],
-    constant AVBDGPUSolverParams &params [[buffer(10)]],
+    device int *nextRecentPairIndices [[buffer(2)]],
+    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(3)]],
+    device int *derivedPairIndices [[buffer(4)]],
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(5)]],
+    constant AVBDGPUSolverParams &params [[buffer(6)]],
     uint lid [[thread_index_in_threadgroup]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
 {
-    threadgroup int cachedPairValues[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int cachedPairRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int cachedPairBaseIndex;
-    threadgroup int cachedPairGrantedCount;
-    threadgroup int manifoldSlotRequests[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int manifoldSlotRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int manifoldSlotBaseIndex;
-    threadgroup int manifoldSlotGrantedCount;
-    threadgroup int activeManifoldLocalIndices[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int activeManifoldRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int activeManifoldBaseIndex;
-    threadgroup int activeManifoldGrantedCount;
 
     int n = params.bodyCount;
     int totalPairs = n * (n - 1) / 2;
     bool validThread = int(tid) < totalPairs;
     bool shouldCachePair = false;
-    bool needsManifoldSlot = false;
+    bool shouldProcessDerivedPair = false;
     int encodedPair = -1;
     int bodyA = -1, bodyB = -1;
-
-    cachedPairValues[lid] = -1;
-    manifoldSlotRequests[lid] = 0;
 
     if (validThread) {
         upper_triangle_pair(tid, n, bodyA, bodyB);
@@ -1436,120 +1309,39 @@ kernel void avbd_broadphase_full(
                 encodedPair = (bodyA << 16) | bodyB;
 
                 if (distSq <= radius * radius) {
-                    needsManifoldSlot = true;
+                    shouldProcessDerivedPair = true;
                 }
             }
         }
     }
 
-    cachedPairValues[lid] = shouldCachePair ? encodedPair : -1;
-    manifoldSlotRequests[lid] = needsManifoldSlot ? 1 : 0;
-
-    // --- Barrier 1: sync broadphase results for batch reservation ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (lid == 0) {
-        // Batch-reserve pair cache
-        int cachedPairLocalCount = 0;
-        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
-            cachedPairRanks[i] = (cachedPairValues[i] >= 0) ? cachedPairLocalCount++ : -1;
-        }
-        int reservedBaseIndex = 0;
-        cachedPairGrantedCount = reserve_recent_pair_range(nextRecentPairState[0], cachedPairLocalCount, reservedBaseIndex);
-        cachedPairBaseIndex = reservedBaseIndex;
-
-        // Batch-reserve manifold slots
-        int manifoldRequestCount = 0;
-        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
-            manifoldSlotRanks[i] = manifoldSlotRequests[i] ? manifoldRequestCount++ : -1;
-        }
-        reservedBaseIndex = 0;
-        manifoldSlotGrantedCount = reserve_manifold_range(manifoldAllocator[0], manifoldRequestCount, reservedBaseIndex);
-        manifoldSlotBaseIndex = reservedBaseIndex;
-    }
-
-    // --- Barrier 2: sync assigned slots for narrowphase + pair write ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Write pair cache
-    if (cachedPairValues[lid] >= 0 && cachedPairRanks[lid] >= 0 && cachedPairRanks[lid] < cachedPairGrantedCount) {
-        nextRecentPairIndices[cachedPairBaseIndex + cachedPairRanks[lid]] = cachedPairValues[lid];
-    }
-
-    // Run narrowphase with batch-assigned manifold slot
-    bool shouldEmitActiveManifold = false;
-    int manifoldSlot = -1;
-    activeManifoldLocalIndices[lid] = -1;
-
-    if (manifoldSlotRanks[lid] >= 0 && manifoldSlotRanks[lid] < manifoldSlotGrantedCount) {
-        manifoldSlot = manifoldSlotBaseIndex + manifoldSlotRanks[lid];
-        process_broadphase_pair_derived(
-            bodyA, bodyB, manifoldSlot,
-            bodies, manifolds, allContacts,
-            contactAllocator[0], params,
-            shouldEmitActiveManifold);
-        activeManifoldLocalIndices[lid] = shouldEmitActiveManifold ? manifoldSlot : -1;
-    }
-
-    // --- Barrier 3: sync narrowphase results for active manifold batch ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (lid == 0) {
-        int activeManifoldLocalCount = 0;
-        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
-            activeManifoldRanks[i] = (activeManifoldLocalIndices[i] >= 0) ? activeManifoldLocalCount++ : -1;
-        }
-        int reservedBaseIndex = 0;
-        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], activeManifoldLocalCount, reservedBaseIndex);
-        activeManifoldBaseIndex = reservedBaseIndex;
-    }
-
-    // --- Barrier 4: sync active manifold reservation for write ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (activeManifoldLocalIndices[lid] >= 0 && activeManifoldRanks[lid] >= 0 && activeManifoldRanks[lid] < activeManifoldGrantedCount) {
-        activeManifoldIndices[activeManifoldBaseIndex + activeManifoldRanks[lid]] = activeManifoldLocalIndices[lid];
-    }
+    compact_broadphase_batch(
+        shouldCachePair, encodedPair, shouldProcessDerivedPair,
+        nextRecentPairIndices, nextRecentPairState,
+        derivedPairIndices, derivedPairState,
+        lid, simd_size);
 }
 
 kernel void avbd_broadphase_partial(
     device AVBDGPUBody *bodies [[buffer(0)]],
     device int *currentRecentPairIndices [[buffer(1)]],
     device AVBDGPURecentPairCacheState *currentRecentPairState [[buffer(2)]],
-    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(3)]],
-    device AVBDGPUManifold *manifolds [[buffer(4)]],
-    device AVBDGPUContact *allContacts [[buffer(5)]],
-    device AVBDGPUContactAllocator *contactAllocator [[buffer(6)]],
-    device int *nextRecentPairIndices [[buffer(7)]],
-    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(8)]],
-    device int *activeManifoldIndices [[buffer(9)]],
-    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(10)]],
-    constant AVBDGPUSolverParams &params [[buffer(11)]],
+    device int *nextRecentPairIndices [[buffer(3)]],
+    device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(4)]],
+    device int *derivedPairIndices [[buffer(5)]],
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(6)]],
+    constant AVBDGPUSolverParams &params [[buffer(7)]],
     uint lid [[thread_index_in_threadgroup]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
 {
-    threadgroup int cachedPairValues[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int cachedPairRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int cachedPairBaseIndex;
-    threadgroup int cachedPairGrantedCount;
-    threadgroup int manifoldSlotRequests[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int manifoldSlotRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int manifoldSlotBaseIndex;
-    threadgroup int manifoldSlotGrantedCount;
-    threadgroup int activeManifoldLocalIndices[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int activeManifoldRanks[AVBD_BROADPHASE_THREADGROUP_SIZE];
-    threadgroup int activeManifoldBaseIndex;
-    threadgroup int activeManifoldGrantedCount;
 
-    int currentRecentPairCount = atomic_load_explicit(&currentRecentPairState[0].count, memory_order_relaxed);
+    int currentRecentPairCount = min(atomic_load_explicit(&currentRecentPairState[0].count, memory_order_relaxed), currentRecentPairState[0].capacity);
     bool validThread = tid < uint(currentRecentPairCount);
     bool shouldCachePair = false;
-    bool needsManifoldSlot = false;
+    bool shouldProcessDerivedPair = false;
     int encodedPair = -1;
     int bodyA = -1, bodyB = -1;
-
-    cachedPairValues[lid] = -1;
-    manifoldSlotRequests[lid] = 0;
 
     if (validThread) {
         encodedPair = currentRecentPairIndices[tid];
@@ -1571,180 +1363,200 @@ kernel void avbd_broadphase_partial(
                 shouldCachePair = true;
 
                 if (distSq <= radius * radius) {
-                    needsManifoldSlot = true;
+                    shouldProcessDerivedPair = true;
                 }
             }
         }
     }
 
-    cachedPairValues[lid] = shouldCachePair ? encodedPair : -1;
-    manifoldSlotRequests[lid] = needsManifoldSlot ? 1 : 0;
+    compact_broadphase_batch(
+        shouldCachePair, encodedPair, shouldProcessDerivedPair,
+        nextRecentPairIndices, nextRecentPairState,
+        derivedPairIndices, derivedPairState,
+        lid, simd_size);
+}
 
-    // --- Barrier 1: sync broadphase results for batch reservation ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (lid == 0) {
-        // Batch-reserve pair cache
-        int cachedPairLocalCount = 0;
-        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
-            cachedPairRanks[i] = (cachedPairValues[i] >= 0) ? cachedPairLocalCount++ : -1;
-        }
-        int reservedBaseIndex = 0;
-        cachedPairGrantedCount = reserve_recent_pair_range(nextRecentPairState[0], cachedPairLocalCount, reservedBaseIndex);
-        cachedPairBaseIndex = reservedBaseIndex;
-
-        // Batch-reserve manifold slots
-        int manifoldRequestCount = 0;
-        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
-            manifoldSlotRanks[i] = manifoldSlotRequests[i] ? manifoldRequestCount++ : -1;
-        }
-        reservedBaseIndex = 0;
-        manifoldSlotGrantedCount = reserve_manifold_range(manifoldAllocator[0], manifoldRequestCount, reservedBaseIndex);
-        manifoldSlotBaseIndex = reservedBaseIndex;
+static inline void compact_broadphase_batch(
+    bool shouldCachePair,
+    int encodedPair,
+    bool shouldProcessDerivedPair,
+    device int *nextRecentPairIndices,
+    device AVBDGPURecentPairCacheState *nextRecentPairState,
+    device int *derivedPairIndices,
+    device AVBDGPUDerivedPairCandidateState *derivedPairState,
+    uint lid,
+    uint simd_size)
+{
+    // Cached pair prefix sum
+    int cachedPairLocalRank = simd_prefix_exclusive_sum(shouldCachePair ? 1 : 0);
+    int cachedPairTotalCount = simd_broadcast(cachedPairLocalRank + (shouldCachePair ? 1 : 0), simd_size - 1);
+    
+    int cachedPairBaseIndex = 0;
+    int cachedPairGrantedCount = 0;
+    if (lid == 0 && cachedPairTotalCount > 0) {
+        cachedPairGrantedCount = reserve_recent_pair_range(nextRecentPairState[0], cachedPairTotalCount, cachedPairBaseIndex);
     }
+    cachedPairBaseIndex = simd_broadcast(cachedPairBaseIndex, 0);
+    cachedPairGrantedCount = simd_broadcast(cachedPairGrantedCount, 0);
 
-    // --- Barrier 2: sync assigned slots for narrowphase + pair write ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Derived pair prefix sum
+    int derivedPairLocalRank = simd_prefix_exclusive_sum(shouldProcessDerivedPair ? 1 : 0);
+    int derivedPairTotalCount = simd_broadcast(derivedPairLocalRank + (shouldProcessDerivedPair ? 1 : 0), simd_size - 1);
 
-    // Write pair cache
-    if (cachedPairValues[lid] >= 0 && cachedPairRanks[lid] >= 0 && cachedPairRanks[lid] < cachedPairGrantedCount) {
-        nextRecentPairIndices[cachedPairBaseIndex + cachedPairRanks[lid]] = cachedPairValues[lid];
+    int derivedPairBaseIndex = 0;
+    int derivedPairGrantedCount = 0;
+    if (lid == 0 && derivedPairTotalCount > 0) {
+        derivedPairGrantedCount = reserve_derived_pair_range(derivedPairState[0], derivedPairTotalCount, derivedPairBaseIndex);
     }
+    derivedPairBaseIndex = simd_broadcast(derivedPairBaseIndex, 0);
+    derivedPairGrantedCount = simd_broadcast(derivedPairGrantedCount, 0);
 
-    // Run narrowphase with batch-assigned manifold slot
-    bool shouldEmitActiveManifold = false;
-    int manifoldSlot = -1;
-    activeManifoldLocalIndices[lid] = -1;
-
-    if (manifoldSlotRanks[lid] >= 0 && manifoldSlotRanks[lid] < manifoldSlotGrantedCount) {
-        manifoldSlot = manifoldSlotBaseIndex + manifoldSlotRanks[lid];
-        process_broadphase_pair_derived(
-            bodyA, bodyB, manifoldSlot,
-            bodies, manifolds, allContacts,
-            contactAllocator[0], params,
-            shouldEmitActiveManifold);
-        activeManifoldLocalIndices[lid] = shouldEmitActiveManifold ? manifoldSlot : -1;
+    // Write-out
+    if (shouldCachePair && cachedPairLocalRank < cachedPairGrantedCount) {
+        nextRecentPairIndices[cachedPairBaseIndex + cachedPairLocalRank] = encodedPair;
     }
-
-    // --- Barrier 3: sync narrowphase results for active manifold batch ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (lid == 0) {
-        int activeManifoldLocalCount = 0;
-        for (uint i = 0; i < AVBD_BROADPHASE_THREADGROUP_SIZE; i++) {
-            activeManifoldRanks[i] = (activeManifoldLocalIndices[i] >= 0) ? activeManifoldLocalCount++ : -1;
-        }
-        int reservedBaseIndex = 0;
-        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], activeManifoldLocalCount, reservedBaseIndex);
-        activeManifoldBaseIndex = reservedBaseIndex;
-    }
-
-    // --- Barrier 4: sync active manifold reservation for write ---
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (activeManifoldLocalIndices[lid] >= 0 && activeManifoldRanks[lid] >= 0 && activeManifoldRanks[lid] < activeManifoldGrantedCount) {
-        activeManifoldIndices[activeManifoldBaseIndex + activeManifoldRanks[lid]] = activeManifoldLocalIndices[lid];
+    if (shouldProcessDerivedPair && derivedPairLocalRank < derivedPairGrantedCount) {
+        derivedPairIndices[derivedPairBaseIndex + derivedPairLocalRank] = encodedPair;
     }
 }
 
-kernel void avbd_process_broadphase_pair_derived(
+kernel void avbd_build_primitive_manifolds(
     device AVBDGPUBody *bodies [[buffer(0)]],
     device int *derivedPairIndices [[buffer(1)]],
     device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(2)]],
-    device AVBDGPUManifoldAllocator *manifoldAllocator [[buffer(3)]],
-    device AVBDGPUManifold *manifolds [[buffer(4)]],
-    device AVBDGPUContact *allContacts [[buffer(5)]],
-    device AVBDGPUContactAllocator *contactAllocator [[buffer(6)]],
-    device int *activeManifoldIndices [[buffer(7)]],
-    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(8)]],
-    constant AVBDGPUSolverParams &params [[buffer(9)]],
+    device AVBDGPUManifold *manifolds [[buffer(3)]],
+    device AVBDGPUContact *allContacts [[buffer(4)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(5)]],
+    device int *activeManifoldIndices [[buffer(6)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(7)]],
+    constant AVBDGPUSolverParams &params [[buffer(8)]],
     uint lid [[thread_index_in_threadgroup]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
 {
-    threadgroup int activeManifoldLocalIndices[AVBD_DERIVED_THREADGROUP_SIZE];
-    threadgroup int activeManifoldRanks[AVBD_DERIVED_THREADGROUP_SIZE];
-    threadgroup int activeManifoldBaseIndex;
-    threadgroup int activeManifoldGrantedCount;
-
-    int derivedPairCount = atomic_load_explicit(&derivedPairState[0].count, memory_order_relaxed);
+    int derivedPairCount = min(atomic_load_explicit(&derivedPairState[0].count, memory_order_relaxed), derivedPairState[0].capacity);
     bool validThread = tid < uint(derivedPairCount);
-    bool shouldEmitActiveManifold = false;
-    int manifoldSlot = -1;
 
-    activeManifoldLocalIndices[lid] = -1;
+    // --- Collision detection (no atomics) ---
+    int manifoldSlot = -1;
+    AVBDGPUContactBuilderMetal builder;
+    builder.count = 0;
+    Mat3 basis = Mat3::identity();
+    int bodyIdxA = -1, bodyIdxB = -1;
 
     if (validThread) {
+        manifoldSlot = int(tid);
         int encodedPair = derivedPairIndices[tid];
-        int bodyA = encodedPair >> 16;
-        int bodyB = encodedPair & 0xFFFF;
-        manifoldSlot = reserve_manifold_slot(manifoldAllocator[0]);
-        if (manifoldSlot >= 0) {
-            process_broadphase_pair_derived(
-                bodyA, bodyB, manifoldSlot,
-                bodies, manifolds, allContacts,
-                contactAllocator[0], params,
-                shouldEmitActiveManifold);
+        bodyIdxA = encodedPair >> 16;
+        bodyIdxB = encodedPair & 0xFFFF;
+
+        device AVBDGPUBody &bodyA = bodies[bodyIdxA];
+        device AVBDGPUBody &bodyB = bodies[bodyIdxB];
+        device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+
+        manifold.bodyA = bodyIdxA;
+        manifold.bodyB = bodyIdxB;
+        manifold.contactCount = 0;
+        manifold.contactBaseIndex = -1;
+        manifold.active = 0;
+        manifold.friction = sqrt(bodyA.friction * bodyB.friction);
+        manifold.basisR0 = float3(1, 0, 0);
+        manifold.basisR1 = float3(0, 1, 0);
+        manifold.basisR2 = float3(0, 0, 1);
+
+        float3 dp = bodyA.positionLin - bodyB.positionLin;
+        float radiusA = body_radius(bodyA, params);
+        float radiusB = body_radius(bodyB, params);
+        float radius = radiusA + radiusB;
+        float distSq = length_squared(dp);
+
+        if (distSq <= radius * radius) {
+            collide_bodies_gpu(bodyA, bodyB, builder, basis, params, params.collisionMargin);
         }
     }
 
-    activeManifoldLocalIndices[lid] = shouldEmitActiveManifold ? manifoldSlot : -1;
+    // --- Batch 2: Reserve contacts (SIMD optimized) ---
+    int myContactOffset = simd_prefix_exclusive_sum(builder.count);
+    int totalContacts = simd_broadcast(myContactOffset + builder.count, simd_size - 1);
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int contactBatchBaseIndex = 0;
+    int contactBatchGrantedCount = 0;
+    if (lid == 0 && totalContacts > 0) {
+        contactBatchGrantedCount = reserve_contact_range(contactAllocator[0], totalContacts, contactBatchBaseIndex);
+    }
+    contactBatchBaseIndex = simd_broadcast(contactBatchBaseIndex, 0);
+    contactBatchGrantedCount = simd_broadcast(contactBatchGrantedCount, 0);
 
-    if (lid == 0) {
-        int activeManifoldLocalCount = 0;
-        for (uint i = 0; i < AVBD_DERIVED_THREADGROUP_SIZE; i++) {
-            activeManifoldRanks[i] = (activeManifoldLocalIndices[i] >= 0) ? activeManifoldLocalCount++ : -1;
+    // --- Write manifold + contacts ---
+    bool shouldEmitActiveManifold = false;
+    if (manifoldSlot >= 0 && builder.count > 0) {
+        int myGrantedContacts = min(builder.count, max(contactBatchGrantedCount - myContactOffset, 0));
+
+        if (myGrantedContacts > 0) {
+            device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+            manifold.basisR0 = basis.r0;
+            manifold.basisR1 = basis.r1;
+            manifold.basisR2 = basis.r2;
+            manifold.contactBaseIndex = contactBatchBaseIndex + myContactOffset;
+            manifold.contactCount = myGrantedContacts;
+            manifold.active = 1;
+            shouldEmitActiveManifold = true;
+            for (int i = 0; i < myGrantedContacts; i++) {
+                allContacts[manifold.contactBaseIndex + i] = builder.contacts[i];
+            }
         }
-        int reservedBaseIndex = 0;
-        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], activeManifoldLocalCount, reservedBaseIndex);
-        activeManifoldBaseIndex = reservedBaseIndex;
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // --- Batch 3: Reserve active manifold slots (SIMD optimized) ---
+    int myActiveRank = simd_prefix_exclusive_sum(shouldEmitActiveManifold ? 1 : 0);
+    int totalActive = simd_broadcast(myActiveRank + (shouldEmitActiveManifold ? 1 : 0), simd_size - 1);
 
-    if (activeManifoldLocalIndices[lid] >= 0 && activeManifoldRanks[lid] >= 0 && activeManifoldRanks[lid] < activeManifoldGrantedCount) {
-        activeManifoldIndices[activeManifoldBaseIndex + activeManifoldRanks[lid]] = activeManifoldLocalIndices[lid];
+    int activeManifoldBaseIndex = 0;
+    int activeManifoldGrantedCount = 0;
+    if (lid == 0 && totalActive > 0) {
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], totalActive, activeManifoldBaseIndex);
+    }
+    activeManifoldBaseIndex = simd_broadcast(activeManifoldBaseIndex, 0);
+    activeManifoldGrantedCount = simd_broadcast(activeManifoldGrantedCount, 0);
+
+    if (shouldEmitActiveManifold && myActiveRank < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + myActiveRank] = manifoldSlot;
     }
 }
 
 kernel void avbd_prepare_broadphase_indirect(
     device AVBDGPURecentPairCacheState *nextRecentPairState [[buffer(0)]],
-    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
-    uint tid [[thread_position_in_grid]])
+    device AVBDGPUIndirectDispatchArgs *broadphaseIndirectArgs [[buffer(1)]],
+    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(2)]],
+    device AVBDGPUIndirectDispatchArgs *derivedPairIndirectArgs [[buffer(3)]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
 {
     if (tid != 0) return;
 
-    int pairCount = atomic_load_explicit(&nextRecentPairState[0].count, memory_order_relaxed);
-    uint threadgroupsX = uint(max(pairCount, 0) + AVBD_BROADPHASE_THREADGROUP_SIZE - 1) / AVBD_BROADPHASE_THREADGROUP_SIZE;
-    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
-    indirectArgs[0].threadgroupsPerGrid[1] = 1;
-    indirectArgs[0].threadgroupsPerGrid[2] = 1;
-}
+    int pairCount = min(atomic_load_explicit(&nextRecentPairState[0].count, memory_order_relaxed), nextRecentPairState[0].capacity);
+    uint threadgroupsX = uint(max(pairCount, 0) + simd_size - 1) / simd_size;
+    broadphaseIndirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
+    broadphaseIndirectArgs[0].threadgroupsPerGrid[1] = 1;
+    broadphaseIndirectArgs[0].threadgroupsPerGrid[2] = 1;
 
-kernel void avbd_prepare_derived_pairs_indirect(
-    device AVBDGPUDerivedPairCandidateState *derivedPairState [[buffer(0)]],
-    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
-    uint tid [[thread_position_in_grid]])
-{
-    if (tid != 0) return;
-
-    int derivedPairCount = atomic_load_explicit(&derivedPairState[0].count, memory_order_relaxed);
-    uint threadgroupsX = uint(max(derivedPairCount, 0) + AVBD_DERIVED_THREADGROUP_SIZE - 1) / AVBD_DERIVED_THREADGROUP_SIZE;
-    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
-    indirectArgs[0].threadgroupsPerGrid[1] = 1;
-    indirectArgs[0].threadgroupsPerGrid[2] = 1;
+    int derivedPairCount = min(atomic_load_explicit(&derivedPairState[0].count, memory_order_relaxed), derivedPairState[0].capacity);
+    uint derivedTgX = uint(max(derivedPairCount, 0) + simd_size - 1) / simd_size;
+    derivedPairIndirectArgs[0].threadgroupsPerGrid[0] = derivedTgX;
+    derivedPairIndirectArgs[0].threadgroupsPerGrid[1] = 1;
+    derivedPairIndirectArgs[0].threadgroupsPerGrid[2] = 1;
 }
 
 kernel void avbd_prepare_active_manifolds_indirect(
     device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(0)]],
     device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
 {
     if (tid != 0) return;
 
-    int manifoldCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
-    uint threadgroupsX = uint(max(manifoldCount, 0) + AVBD_BROADPHASE_THREADGROUP_SIZE - 1) / AVBD_BROADPHASE_THREADGROUP_SIZE;
+    int manifoldCount = min(atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed), activeManifoldState[0].capacity);
+    uint threadgroupsX = uint(max(manifoldCount, 0) + simd_size - 1) / simd_size;
     indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
     indirectArgs[0].threadgroupsPerGrid[1] = 1;
     indirectArgs[0].threadgroupsPerGrid[2] = 1;
@@ -1779,7 +1591,7 @@ kernel void avbd_build_adjacency_manifolds(
     device AVBDGPUAdjacency *adjacency [[buffer(3)]],
     uint tid [[thread_position_in_grid]])
 {
-    int activeManifoldCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    int activeManifoldCount = min(atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed), activeManifoldState[0].capacity);
     if (tid >= uint(activeManifoldCount)) return;
 
     int manifoldIndex = activeManifoldIndices[tid];
@@ -1914,7 +1726,7 @@ kernel void avbd_body_solve(
     device AVBDGPUAdjacency &adj = adjacency[tid];
 
     // ── Accumulate joint forces ──
-    int jointAdjCount = atomic_load_explicit(&adj.jointCount, memory_order_relaxed);
+    int jointAdjCount = min(atomic_load_explicit(&adj.jointCount, memory_order_relaxed), AVBD_MAX_CONSTRAINTS_PER_BODY);
     for (int ji = 0; ji < jointAdjCount; ji++) {
         device AVBDGPUJoint &j = joints[adj.jointIndices[ji]];
         if (j.broken) continue;
@@ -1993,7 +1805,7 @@ kernel void avbd_body_solve(
     }
 
     // ── Accumulate spring forces ──
-    int springAdjCount = atomic_load_explicit(&adj.springCount, memory_order_relaxed);
+    int springAdjCount = min(atomic_load_explicit(&adj.springCount, memory_order_relaxed), AVBD_MAX_CONSTRAINTS_PER_BODY);
     for (int si = 0; si < springAdjCount; si++) {
         device AVBDGPUSpring &s = springs[adj.springIndices[si]];
         float3 pA = xform(bodies[s.bodyA].positionLin, bodies[s.bodyA].positionAng, s.rA);
@@ -2027,7 +1839,7 @@ kernel void avbd_body_solve(
     }
 
     // ── Accumulate manifold (contact) forces ──
-    int manifoldAdjCount = atomic_load_explicit(&adj.manifoldCount, memory_order_relaxed);
+    int manifoldAdjCount = min(atomic_load_explicit(&adj.manifoldCount, memory_order_relaxed), AVBD_MAX_CONSTRAINTS_PER_BODY);
     for (int mi = 0; mi < manifoldAdjCount; mi++) {
         device AVBDGPUManifold &m = manifolds[adj.manifoldIndices[mi]];
         if (!m.active || m.contactCount == 0) continue;
@@ -2173,7 +1985,7 @@ kernel void avbd_dual_update_manifolds(
     constant AVBDGPUSolverParams &params [[buffer(5)]],
     uint tid [[thread_position_in_grid]])
 {
-    int activeManifoldCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    int activeManifoldCount = min(atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed), activeManifoldState[0].capacity);
     if (tid >= uint(activeManifoldCount)) return;
 
     device AVBDGPUManifold &m = manifolds[activeManifoldIndices[tid]];
@@ -2267,7 +2079,7 @@ kernel void avbd_warmstart_contacts(
     constant AVBDGPUSolverParams &params [[buffer(9)]],
     uint tid [[thread_position_in_grid]])
 {
-    int activeCount = atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed);
+    int activeCount = min(atomic_load_explicit(&activeManifoldState[0].count, memory_order_relaxed), activeManifoldState[0].capacity);
     if (tid >= uint(activeCount)) return;
 
     int manifoldIdx = activeManifoldIndices[tid];
@@ -2275,7 +2087,7 @@ kernel void avbd_warmstart_contacts(
     if (!m.active || m.contactCount == 0) return;
 
     // Search previous frame for matching manifold (same body pair)
-    int prevActiveCount = atomic_load_explicit(&prevActiveManifoldState[0].count, memory_order_relaxed);
+    int prevActiveCount = min(atomic_load_explicit(&prevActiveManifoldState[0].count, memory_order_relaxed), prevActiveManifoldState[0].capacity);
     int prevMatchIdx = -1;
     for (int pi = 0; pi < prevActiveCount; pi++) {
         int prevMIdx = prevActiveManifoldIndices[pi];

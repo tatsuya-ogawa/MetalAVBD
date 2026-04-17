@@ -21,8 +21,6 @@
 #define AVBD_MAX_CONSTRAINTS_PER_BODY 32
 #define AVBD_MAX_CONTACTS_PER_PAIR 4
 #define AVBD_MAX_CONTACTS_PER_PAIR_BURST (AVBD_MAX_CONTACTS_PER_PAIR * 2)
-#define AVBD_BROADPHASE_THREADGROUP_SIZE 64
-#define AVBD_DERIVED_THREADGROUP_SIZE 32
 #define AVBD_MAX_COLLISIONS_PER_BODY 16
 
 #ifdef __METAL_VERSION__
@@ -113,7 +111,7 @@ typedef struct {
 // Per-body collision exclusion list (joint-connected and ignored pairs).
 typedef struct {
     int excludeIndices[AVBD_MAX_CONSTRAINTS_PER_BODY];
-    AVBD_ATOMIC_INT excludeCount;
+    int excludeCount;
 } AVBDGPUCollisionExclusion;
 
 // Global contact allocator state for broadphase compaction.
@@ -121,12 +119,6 @@ typedef struct {
     AVBD_ATOMIC_INT nextContactIndex;
     int contactCapacity;
 } AVBDGPUContactAllocator;
-
-// Global manifold allocator state for dynamic manifold slot allocation.
-typedef struct {
-    AVBD_ATOMIC_INT nextManifoldIndex;
-    int manifoldCapacity;
-} AVBDGPUManifoldAllocator;
 
 // Cached broadphase pair list state for indirect dispatch.
 typedef struct {
@@ -173,7 +165,6 @@ typedef struct {
     int bodyCount;
     int jointCount;
     int springCount;
-    int manifoldCapacity;
     float collisionMargin;
     float cacheMargin;
     float cacheTimeHorizon;
