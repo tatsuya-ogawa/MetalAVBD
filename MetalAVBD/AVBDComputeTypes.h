@@ -22,6 +22,7 @@
 #define AVBD_MAX_CONTACTS_PER_PAIR 4
 #define AVBD_MAX_CONTACTS_PER_PAIR_BURST (AVBD_MAX_CONTACTS_PER_PAIR * 2)
 #define AVBD_MAX_COLLISIONS_PER_BODY 16
+#define AVBD_MAX_COLLISION_MESH_SDFS 64
 
 #ifdef __METAL_VERSION__
 #define AVBD_ATOMIC_INT metal::atomic_int
@@ -138,6 +139,45 @@ typedef struct {
     int capacity;
 } AVBDGPUActiveManifoldListState;
 
+typedef struct {
+    int vertexOffset;
+    int vertexCount;
+    int indexOffset;
+    int indexCount;
+    int ownerBodyIndex;
+    int sdfResourceIndex;
+    vector_int2 _reserved0;
+    vector_float4 minBounds;
+    vector_float4 maxBounds;
+    vector_float4 sdfLocalMinBounds;
+    vector_float4 sdfLocalMaxBounds;
+    vector_float4 sdfVoxelSize;
+    vector_int4 sdfResolution;
+    matrix_float4x4 sdfTransform;
+    matrix_float4x4 sdfInvTransform;
+} AVBDGPUCollisionMeshInfo;
+
+// Candidate pair list for primitive-vs-mesh broadphase.
+typedef struct {
+    int bodyIndex;
+    int meshIndex;
+} AVBDGPUPrimitiveMeshPair;
+
+typedef struct {
+    AVBD_ATOMIC_INT count;
+    int capacity;
+} AVBDGPUPrimitiveMeshPairListState;
+
+typedef struct {
+    int meshIndexA;
+    int meshIndexB;
+} AVBDGPUMeshMeshPair;
+
+typedef struct {
+    AVBD_ATOMIC_INT count;
+    int capacity;
+} AVBDGPUMeshMeshPairListState;
+
 // Matches MTLDispatchThreadgroupsIndirectArguments layout.
 typedef struct {
     unsigned int threadgroupsPerGrid[3];
@@ -165,6 +205,8 @@ typedef struct {
     int bodyCount;
     int jointCount;
     int springCount;
+    int meshCount;
+    int primitiveMeshManifoldOffset;
     float collisionMargin;
     float cacheMargin;
     float cacheTimeHorizon;
@@ -173,6 +215,8 @@ typedef struct {
     float stickThreshold;
     int torusApproxSphereCount;
     float torusApproxSphereRadiusScale;
+    float linearDamping;
+    float angularDamping;
 } AVBDGPUSolverParams;
 
 #endif /* AVBDComputeTypes_h */

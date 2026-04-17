@@ -43,7 +43,8 @@ typedef NS_CLOSED_ENUM(EnumBackingType, AVBDCollisionFeaturePrefix)
     AVBDCollisionFeaturePrefixSphereBox    = 4 << 24,
     AVBDCollisionFeaturePrefixTorusSphere  = 5 << 24,
     AVBDCollisionFeaturePrefixTorusBox     = 6 << 24,
-    AVBDCollisionFeaturePrefixTorusTorus   = 7 << 24
+    AVBDCollisionFeaturePrefixTorusTorus   = 7 << 24,
+    AVBDCollisionFeaturePrefixPrimitiveMesh = 8 << 24
 };
 
 #define AVBD_TORUS_APPROX_SPHERE_COUNT_MIN 4
@@ -79,6 +80,9 @@ typedef NS_ENUM(EnumBackingType, VertexAttribute)
 typedef struct
 {
     matrix_float4x4 viewProjectionMatrix;
+    matrix_float4x4 inverseViewProjectionMatrix;
+    vector_float3 cameraWorldPosition;
+    float padding0;
 } Uniforms;
 
 typedef struct

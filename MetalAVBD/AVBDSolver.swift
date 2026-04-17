@@ -17,6 +17,11 @@ nonisolated private let satAxisEpsilon: Float = Float(AVBD_COLLISION_SAT_AXIS_EP
 nonisolated private let planeEpsilon: Float = Float(AVBD_COLLISION_PLANE_EPSILON)
 nonisolated private let contactMergeDistSq: Float = Float(AVBD_COLLISION_CONTACT_MERGE_DIST_SQ)
 
+nonisolated private func avbdDampingFactor(damping: Float, dt: Float) -> Float {
+    guard damping > 0 else { return 1.0 }
+    return exp(-damping * dt)
+}
+
 nonisolated struct AVBDMat3 {
     var r0: SIMD3<Float>
     var r1: SIMD3<Float>
@@ -689,6 +694,8 @@ nonisolated final class AVBDSolver {
     var betaLin: Float = 100_000.0
     var betaAng: Float = 100.0
     var gamma: Float = 0.999
+    var linearDamping: Float = 0.0
+    var angularDamping: Float = 0.0
 
     private(set) var bodies: [AVBDPhysicsBody]
     private var forces: [AVBDForce]
@@ -746,6 +753,8 @@ nonisolated final class AVBDSolver {
         broadphase()
 
         forces = forces.filter { $0.initialize(solver: self) }
+        let linearDampingFactor = avbdDampingFactor(damping: linearDamping, dt: dt)
+        let angularDampingFactor = avbdDampingFactor(damping: angularDamping, dt: dt)
 
         for body in bodies {
             body.inertialLin = body.positionLin + body.velocityLin * dt
@@ -801,6 +810,8 @@ nonisolated final class AVBDSolver {
             if body.mass > 0 {
                 body.velocityLin = (body.positionLin - body.initialLin) / dt
                 body.velocityAng = quatDelta(body.positionAng, body.initialAng) / dt
+                body.velocityLin *= linearDampingFactor
+                body.velocityAng *= angularDampingFactor
             }
         }
     }

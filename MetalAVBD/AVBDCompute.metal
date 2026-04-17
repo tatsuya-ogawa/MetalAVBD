@@ -121,6 +121,10 @@ static float sign_f(float x) {
     return x < 0 ? -1.0f : (x > 0 ? 1.0f : 0.0f);
 }
 
+static float damping_factor(float damping, float dt) {
+    return damping <= 0.0f ? 1.0f : exp(-damping * dt);
+}
+
 static float3 clamp_vec(float3 v, float lo, float hi) {
     return float3(clamp(v.x, lo, hi), clamp(v.y, lo, hi), clamp(v.z, lo, hi));
 }
@@ -144,6 +148,7 @@ constant int AVBD_GPU_FEATURE_SPHERE_BOX = AVBDCollisionFeaturePrefixSphereBox;
 constant int AVBD_GPU_FEATURE_TORUS_SPHERE = AVBDCollisionFeaturePrefixTorusSphere;
 constant int AVBD_GPU_FEATURE_TORUS_BOX = AVBDCollisionFeaturePrefixTorusBox;
 constant int AVBD_GPU_FEATURE_TORUS_TORUS = AVBDCollisionFeaturePrefixTorusTorus;
+constant int AVBD_GPU_FEATURE_PRIMITIVE_MESH = AVBDCollisionFeaturePrefixPrimitiveMesh;
 constant int AVBD_GPU_MAX_POLY_VERTS = AVBD_COLLISION_MAX_POLY_VERTS;
 constant int AVBD_GPU_TORUS_APPROX_SPHERE_COUNT_MAX = AVBD_TORUS_APPROX_SPHERE_COUNT_MAX;
 constant int AVBD_GPU_TORUS_APPROX_SPHERE_COUNT_DEFAULT = AVBD_TORUS_APPROX_SPHERE_COUNT_DEFAULT;
@@ -271,6 +276,28 @@ static int reserve_active_manifold_range(device AVBDGPUActiveManifoldListState &
     return grantedCount;
 }
 
+static int reserve_primitive_mesh_pair_range(device AVBDGPUPrimitiveMeshPairListState &state,
+                                             int requestedCount,
+                                             thread int &baseIndex) {
+    if (requestedCount <= 0) return 0;
+    int index = atomic_fetch_add_explicit(&state.count, requestedCount, memory_order_relaxed);
+    if (index >= state.capacity) return 0;
+    int grantedCount = min(requestedCount, state.capacity - index);
+    baseIndex = index;
+    return grantedCount;
+}
+
+static int reserve_mesh_mesh_pair_range(device AVBDGPUMeshMeshPairListState &state,
+                                        int requestedCount,
+                                        thread int &baseIndex) {
+    if (requestedCount <= 0) return 0;
+    int index = atomic_fetch_add_explicit(&state.count, requestedCount, memory_order_relaxed);
+    if (index >= state.capacity) return 0;
+    int grantedCount = min(requestedCount, state.capacity - index);
+    baseIndex = index;
+    return grantedCount;
+}
+
 static float abs_dot(float3 a, float3 b) {
     return abs(dot(a, b));
 }
@@ -339,6 +366,37 @@ static float3 torus_sphere_world_center(device const AVBDGPUBody &body, int inde
     return quat_act(body.positionAng, torus_sphere_local_center(body, index, params)) + body.positionLin;
 }
 
+static void make_body_aabb(device const AVBDGPUBody &body,
+                           constant AVBDGPUSolverParams &params,
+                           thread float3 &minBounds,
+                           thread float3 &maxBounds) {
+    if (body.renderShape == AVBD_GPU_RENDER_SHAPE_BOX) {
+        AVBDGPUOBBMetal box;
+        make_obb(body, box);
+        float3 extent =
+            abs(box.axis[0]) * box.halfSize.x +
+            abs(box.axis[1]) * box.halfSize.y +
+            abs(box.axis[2]) * box.halfSize.z;
+        minBounds = box.center - extent;
+        maxBounds = box.center + extent;
+        return;
+    }
+
+    float radius = body_radius(body, params);
+    float3 extent = float3(radius);
+    minBounds = body.positionLin - extent;
+    maxBounds = body.positionLin + extent;
+}
+
+static bool aabb_overlaps(float3 minA,
+                          float3 maxA,
+                          float3 minB,
+                          float3 maxB) {
+    return minA.x <= maxB.x && maxA.x >= minB.x &&
+           minA.y <= maxB.y && maxA.y >= minB.y &&
+           minA.z <= maxB.z && maxA.z >= minB.z;
+}
+
 static bool test_axis(thread const AVBDGPUOBBMetal &boxA,
                       thread const AVBDGPUOBBMetal &boxB,
                       float3 delta,
@@ -394,6 +452,169 @@ static float3 support_point(thread const AVBDGPUOBBMetal &box, float3 dir) {
         + box.axis[2] * (box.halfSize.z * sz);
 }
 
+static float3 safe_normalize(float3 value, float3 fallback) {
+    float lenSq = length_squared(value);
+    if (lenSq <= 1.0e-12f) {
+        return fallback;
+    }
+    return value * rsqrt(lenSq);
+}
+
+static bool ray_triangle_intersection(float3 origin,
+                                      float3 direction,
+                                      float maxDistance,
+                                      float3 v0,
+                                      float3 v1,
+                                      float3 v2,
+                                      thread float &outT,
+                                      thread float3 &outNormal) {
+    float3 edge01 = v1 - v0;
+    float3 edge02 = v2 - v0;
+    float3 faceNormal = cross(edge01, edge02);
+    float normalLengthSq = length_squared(faceNormal);
+    if (normalLengthSq <= 1.0e-12f) {
+        return false;
+    }
+
+    float3 p = cross(direction, edge02);
+    float det = dot(edge01, p);
+    if (abs(det) <= 1.0e-8f) {
+        return false;
+    }
+
+    float invDet = 1.0f / det;
+    float3 t = origin - v0;
+    float u = dot(t, p) * invDet;
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+
+    float3 q = cross(t, edge01);
+    float v = dot(direction, q) * invDet;
+    if (v < 0.0f || (u + v) > 1.0f) {
+        return false;
+    }
+
+    float hitT = dot(edge02, q) * invDet;
+    if (hitT < 0.0f || hitT > maxDistance) {
+        return false;
+    }
+
+    outT = hitT;
+    outNormal = faceNormal * rsqrt(normalLengthSq);
+    return true;
+}
+
+struct AVBDCollisionMeshSDFSet {
+    array<texture3d<float, access::sample>, AVBD_MAX_COLLISION_MESH_SDFS> sdf [[id(0)]];
+};
+
+constant float3 AVBD_GPU_SDF_RAY_DIRECTION = float3(0.728492f, 0.514883f, 0.452173f);
+constexpr sampler avbd_sdf_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
+
+static float point_segment_distance(float3 point, float3 a, float3 b) {
+    float3 ab = b - a;
+    float denom = max(dot(ab, ab), 1.0e-12f);
+    float t = clamp(dot(point - a, ab) / denom, 0.0f, 1.0f);
+    return length(point - (a + ab * t));
+}
+
+static float point_triangle_unsigned_distance(float3 point, float3 v0, float3 v1, float3 v2) {
+    float3 edge0 = v1 - v0;
+    float3 edge1 = v2 - v0;
+    float3 v0ToPoint = point - v0;
+
+    float a = dot(edge0, edge0);
+    float b = dot(edge0, edge1);
+    float c = dot(edge1, edge1);
+    float d = dot(edge0, v0ToPoint);
+    float e = dot(edge1, v0ToPoint);
+    float det = a * c - b * b;
+    float s = b * e - c * d;
+    float t = b * d - a * e;
+
+    if (s + t <= det) {
+        if (s < 0.0f) {
+            if (t < 0.0f) {
+                return min(point_segment_distance(point, v0, v1), point_segment_distance(point, v0, v2));
+            }
+            return point_segment_distance(point, v0, v2);
+        }
+        if (t < 0.0f) {
+            return point_segment_distance(point, v0, v1);
+        }
+    } else {
+        if (s < 0.0f) {
+            return point_segment_distance(point, v1, v2);
+        }
+        if (t < 0.0f) {
+            return point_segment_distance(point, v1, v2);
+        }
+    }
+
+    float invDet = 1.0f / max(det, 1.0e-12f);
+    s *= invDet;
+    t *= invDet;
+    float3 closestPoint = v0 + edge0 * s + edge1 * t;
+    return length(point - closestPoint);
+}
+
+static bool point_in_collision_mesh_sdf_bounds(float3 pointLocal, device const AVBDGPUCollisionMeshInfo &meshInfo) {
+    return all(pointLocal >= meshInfo.sdfLocalMinBounds.xyz) && all(pointLocal <= meshInfo.sdfLocalMaxBounds.xyz);
+}
+
+static float3 collision_mesh_sdf_texcoord(float3 pointLocal, device const AVBDGPUCollisionMeshInfo &meshInfo) {
+    float3 extent = max(meshInfo.sdfLocalMaxBounds.xyz - meshInfo.sdfLocalMinBounds.xyz, float3(1.0e-5f));
+    return (pointLocal - meshInfo.sdfLocalMinBounds.xyz) / extent;
+}
+
+static float sample_collision_mesh_sdf_value(texture3d<float, access::sample> sdfTexture,
+                                             float3 pointLocal,
+                                             device const AVBDGPUCollisionMeshInfo &meshInfo) {
+    float3 texCoord = collision_mesh_sdf_texcoord(pointLocal, meshInfo);
+    if (any(texCoord < 0.0f) || any(texCoord > 1.0f)) {
+        return FLT_MAX;
+    }
+    return sdfTexture.sample(avbd_sdf_sampler, texCoord).r;
+}
+
+static float3 collision_mesh_sdf_local_normal(texture3d<float, access::sample> sdfTexture,
+                                              float3 pointLocal,
+                                              device const AVBDGPUCollisionMeshInfo &meshInfo) {
+    float3 eps = max(meshInfo.sdfVoxelSize.xyz, float3(1.0e-4f));
+    float sdfXPos = sample_collision_mesh_sdf_value(sdfTexture, pointLocal + float3(eps.x, 0.0f, 0.0f), meshInfo);
+    float sdfXNeg = sample_collision_mesh_sdf_value(sdfTexture, pointLocal - float3(eps.x, 0.0f, 0.0f), meshInfo);
+    float sdfYPos = sample_collision_mesh_sdf_value(sdfTexture, pointLocal + float3(0.0f, eps.y, 0.0f), meshInfo);
+    float sdfYNeg = sample_collision_mesh_sdf_value(sdfTexture, pointLocal - float3(0.0f, eps.y, 0.0f), meshInfo);
+    float sdfZPos = sample_collision_mesh_sdf_value(sdfTexture, pointLocal + float3(0.0f, 0.0f, eps.z), meshInfo);
+    float sdfZNeg = sample_collision_mesh_sdf_value(sdfTexture, pointLocal - float3(0.0f, 0.0f, eps.z), meshInfo);
+
+    if (!isfinite(sdfXPos)) sdfXPos = 1.0f;
+    if (!isfinite(sdfXNeg)) sdfXNeg = 1.0f;
+    if (!isfinite(sdfYPos)) sdfYPos = 1.0f;
+    if (!isfinite(sdfYNeg)) sdfYNeg = 1.0f;
+    if (!isfinite(sdfZPos)) sdfZPos = 1.0f;
+    if (!isfinite(sdfZNeg)) sdfZNeg = 1.0f;
+
+    float3 gradient = float3(
+        (sdfXPos - sdfXNeg) / max(2.0f * eps.x, 1.0e-5f),
+        (sdfYPos - sdfYNeg) / max(2.0f * eps.y, 1.0e-5f),
+        (sdfZPos - sdfZNeg) / max(2.0f * eps.z, 1.0e-5f)
+    );
+    return safe_normalize(gradient, float3(0.0f, 1.0f, 0.0f));
+}
+
+static float3 collision_mesh_sdf_world_normal(float3 localNormal,
+                                              device const AVBDGPUCollisionMeshInfo &meshInfo) {
+    float3x3 invLinear = float3x3(
+        meshInfo.sdfInvTransform.columns[0].xyz,
+        meshInfo.sdfInvTransform.columns[1].xyz,
+        meshInfo.sdfInvTransform.columns[2].xyz
+    );
+    float3 worldNormal = transpose(invLinear) * localNormal;
+    return safe_normalize(worldNormal, float3(0.0f, 1.0f, 0.0f));
+}
+
 static void get_face_axes(thread const AVBDGPUOBBMetal &box,
                           int axisIndex,
                           thread float3 &u,
@@ -417,6 +638,95 @@ static void get_face_axes(thread const AVBDGPUOBBMetal &box,
         extentU = box.halfSize.x;
         extentV = box.halfSize.y;
     }
+}
+
+static void build_box_face_sample_points(device const AVBDGPUBody &body,
+                                         float3 directionToMesh,
+                                         thread float3 samplePoints[AVBD_MAX_CONTACTS_PER_PAIR],
+                                         thread int sampleSeeds[AVBD_MAX_CONTACTS_PER_PAIR],
+                                         thread int &sampleCount) {
+    AVBDGPUOBBMetal box;
+    make_obb(body, box);
+
+    float3 dir = safe_normalize(directionToMesh, box.axis[1]);
+    float projection0 = abs(dot(dir, box.axis[0]));
+    float projection1 = abs(dot(dir, box.axis[1]));
+    float projection2 = abs(dot(dir, box.axis[2]));
+
+    int axisIndex = 0;
+    float bestProjection = projection0;
+    if (projection1 > bestProjection) {
+        axisIndex = 1;
+        bestProjection = projection1;
+    }
+    if (projection2 > bestProjection) {
+        axisIndex = 2;
+    }
+
+    float faceSign = dot(dir, box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
+    float3 faceCenter = box.center + box.axis[axisIndex] * (box.halfSize[axisIndex] * faceSign);
+    float3 u, v;
+    float extentU, extentV;
+    get_face_axes(box, axisIndex, u, v, extentU, extentV);
+
+    samplePoints[0] = faceCenter + u * extentU + v * extentV;
+    samplePoints[1] = faceCenter - u * extentU + v * extentV;
+    samplePoints[2] = faceCenter - u * extentU - v * extentV;
+    samplePoints[3] = faceCenter + u * extentU - v * extentV;
+    sampleSeeds[0] = (axisIndex << 4) | 0;
+    sampleSeeds[1] = (axisIndex << 4) | 1;
+    sampleSeeds[2] = (axisIndex << 4) | 2;
+    sampleSeeds[3] = (axisIndex << 4) | 3;
+    sampleCount = 4;
+}
+
+static void build_primitive_mesh_sample_points(device const AVBDGPUBody &body,
+                                               float3 meshCenter,
+                                               constant AVBDGPUSolverParams &params,
+                                               thread float3 samplePoints[AVBD_MAX_CONTACTS_PER_PAIR],
+                                               thread int sampleSeeds[AVBD_MAX_CONTACTS_PER_PAIR],
+                                               thread int &sampleCount) {
+    float3 bodyToMesh = meshCenter - body.positionLin;
+    float3 bodyDir = safe_normalize(bodyToMesh, float3(0.0f, 1.0f, 0.0f));
+
+    if (body.renderShape == AVBD_GPU_RENDER_SHAPE_BOX) {
+        build_box_face_sample_points(body, bodyToMesh, samplePoints, sampleSeeds, sampleCount);
+        return;
+    }
+
+    if (body.renderShape == AVBD_GPU_RENDER_SHAPE_TORUS) {
+        int torusSphereCount = torus_approx_sphere_count(params);
+        int desiredCount = min(AVBD_MAX_CONTACTS_PER_PAIR, torusSphereCount);
+        float angleStep = (2.0f * M_PI_F) / float(torusSphereCount);
+        float3 localDir = quat_act(quat_conj(body.positionAng), bodyDir);
+        float theta = atan2(localDir.y, localDir.x);
+        if (theta < 0.0f) theta += 2.0f * M_PI_F;
+        int centerIndex = int(round(theta / angleStep)) % torusSphereCount;
+        int offsets[AVBD_MAX_CONTACTS_PER_PAIR] = { 0, 1, -1, 2 };
+        float torusSphereRadius = torus_approx_sphere_radius(body, params);
+
+        for (int sampleIndex = 0; sampleIndex < desiredCount; ++sampleIndex) {
+            int torusSphereIndex = centerIndex + offsets[sampleIndex];
+            while (torusSphereIndex < 0) {
+                torusSphereIndex += torusSphereCount;
+            }
+            while (torusSphereIndex >= torusSphereCount) {
+                torusSphereIndex -= torusSphereCount;
+            }
+
+            float3 torusSphereCenter = torus_sphere_world_center(body, torusSphereIndex, params);
+            float3 sampleDir = safe_normalize(meshCenter - torusSphereCenter, bodyDir);
+            samplePoints[sampleIndex] = torusSphereCenter + sampleDir * torusSphereRadius;
+            sampleSeeds[sampleIndex] = torusSphereIndex & 0xFF;
+        }
+
+        sampleCount = desiredCount;
+        return;
+    }
+
+    samplePoints[0] = body.positionLin + bodyDir * body_radius(body, params);
+    sampleSeeds[0] = 0;
+    sampleCount = 1;
 }
 
 static AVBDGPUFaceFrameMetal build_face_frame(thread const AVBDGPUOBBMetal &box, int axisIndex, float3 outwardNormal) {
@@ -542,6 +852,64 @@ static void append_contact(thread AVBDGPUContactBuilderMetal &builder,
     builder.count++;
 }
 
+static AVBDGPUContact make_mesh_contact(device const AVBDGPUBody &bodyA,
+                                        float3 xA,
+                                        float3 xMeshWorld,
+                                        int featureKey)
+{
+    AVBDGPUContact contact;
+    contact.rA = quat_act(quat_conj(bodyA.positionAng), xA - bodyA.positionLin);
+    contact.rB = xMeshWorld;
+    contact.C0 = float3(0);
+    contact.penalty = float3(0);
+    contact.lambda = float3(0);
+    contact.featureKey = featureKey;
+    contact.active = 0;
+    contact.stick = 0;
+    return contact;
+}
+
+static void append_mesh_contact(thread AVBDGPUContactBuilderMetal &builder,
+                                device const AVBDGPUBody &bodyA,
+                                float3 xA,
+                                float3 xMeshWorld,
+                                int featureKey)
+{
+    float3 midpoint = (xA + xMeshWorld) * 0.5f;
+    for (int i = 0; i < builder.count; i++) {
+        if (length_squared(midpoint - builder.midpoints[i]) < AVBD_GPU_CONTACT_MERGE_DIST_SQ) {
+            return;
+        }
+    }
+    if (builder.count >= AVBD_MAX_CONTACTS_PER_PAIR) {
+        return;
+    }
+    builder.contacts[builder.count] = make_mesh_contact(bodyA, xA, xMeshWorld, featureKey);
+    builder.midpoints[builder.count] = midpoint;
+    builder.count++;
+}
+
+static void append_primitive_mesh_contact(thread AVBDGPUContactBuilderMetal &builder,
+                                          device const AVBDGPUBody &bodyA,
+                                          device const AVBDGPUBody &bodyB,
+                                          float3 xA,
+                                          float3 xMeshWorld,
+                                          int featureKey)
+{
+    float3 midpoint = (xA + xMeshWorld) * 0.5f;
+    for (int i = 0; i < builder.count; i++) {
+        if (length_squared(midpoint - builder.midpoints[i]) < AVBD_GPU_CONTACT_MERGE_DIST_SQ) {
+            return;
+        }
+    }
+    if (builder.count >= AVBD_MAX_CONTACTS_PER_PAIR) {
+        return;
+    }
+    builder.contacts[builder.count] = make_contact(bodyA, bodyB, xA, xMeshWorld, featureKey);
+    builder.midpoints[builder.count] = midpoint;
+    builder.count++;
+}
+
 static void finalize_builder_contacts(device const AVBDGPUBody &bodyA,
                                       device const AVBDGPUBody &bodyB,
                                       thread AVBDGPUContactBuilderMetal &builder,
@@ -556,6 +924,25 @@ static void finalize_builder_contacts(device const AVBDGPUBody &bodyA,
         builder.contacts[i].penalty = float3(AVBD_GPU_CONTACT_PENALTY_START);
         builder.contacts[i].active = 1;
     }
+}
+
+static void finalize_builder_mesh_contacts(device const AVBDGPUBody &bodyA,
+                                           thread AVBDGPUContactBuilderMetal &builder,
+                                           thread Mat3 &basis,
+                                           float collisionMargin)
+{
+    for (int i = 0; i < builder.count; i++) {
+        float3 xA = quat_act(bodyA.positionAng, builder.contacts[i].rA) + bodyA.positionLin;
+        float3 diff = xA - builder.contacts[i].rB;
+        builder.contacts[i].C0 = float3(dot(basis.r0, diff), dot(basis.r1, diff), dot(basis.r2, diff)) + float3(collisionMargin, 0, 0);
+        builder.contacts[i].penalty = float3(AVBD_GPU_CONTACT_PENALTY_START);
+        builder.contacts[i].active = 1;
+    }
+}
+
+static int primitive_mesh_feature_key(int meshIndex, int triangleIndex, int sampleSeed) {
+    int encoded = ((meshIndex * 73856093) ^ (triangleIndex * 19349663) ^ (sampleSeed * 83492791)) & 0x00FFFFFF;
+    return AVBD_GPU_FEATURE_PRIMITIVE_MESH | encoded;
 }
 
 static void support_edge(thread const AVBDGPUOBBMetal &box,
@@ -1562,6 +1949,591 @@ kernel void avbd_prepare_active_manifolds_indirect(
     indirectArgs[0].threadgroupsPerGrid[2] = 1;
 }
 
+kernel void avbd_initialize_mesh_sdf(
+    texture3d<float, access::write> sdfTexture [[texture(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= sdfTexture.get_width() || gid.y >= sdfTexture.get_height() || gid.z >= sdfTexture.get_depth()) {
+        return;
+    }
+    sdfTexture.write(FLT_MAX, gid);
+}
+
+kernel void avbd_accumulate_mesh_sdf(
+    device const float3 *vertices [[buffer(0)]],
+    device const uint *indices [[buffer(1)]],
+    texture3d<float, access::read_write> sdfTexture [[texture(0)]],
+    device uint *insideCounts [[buffer(2)]],
+    constant uint &triangleOffset [[buffer(3)]],
+    constant uint &triangleChunkCount [[buffer(4)]],
+    constant float3 &sdfOrigin [[buffer(5)]],
+    constant float3 &voxelSize [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= sdfTexture.get_width() || gid.y >= sdfTexture.get_height() || gid.z >= sdfTexture.get_depth()) {
+        return;
+    }
+
+    uint width = sdfTexture.get_width();
+    uint height = sdfTexture.get_height();
+    uint linearIndex = gid.x + gid.y * width + gid.z * width * height;
+    float3 localPoint = sdfOrigin + (float3(gid) + 0.5f) * voxelSize;
+
+    float minDistance = sdfTexture.read(gid).r;
+    uint insideCount = insideCounts[linearIndex];
+    for (uint triangleIndex = triangleOffset; triangleIndex < triangleOffset + triangleChunkCount; ++triangleIndex) {
+        uint indexBase = triangleIndex * 3u;
+        float3 v0 = vertices[indices[indexBase + 0u]];
+        float3 v1 = vertices[indices[indexBase + 1u]];
+        float3 v2 = vertices[indices[indexBase + 2u]];
+
+        minDistance = min(minDistance, point_triangle_unsigned_distance(localPoint, v0, v1, v2));
+
+        float hitT = 0.0f;
+        float3 hitNormal = float3(0.0f);
+        if (ray_triangle_intersection(localPoint, AVBD_GPU_SDF_RAY_DIRECTION, FLT_MAX, v0, v1, v2, hitT, hitNormal)) {
+            insideCount += 1u;
+        }
+    }
+
+    sdfTexture.write(minDistance, gid);
+    insideCounts[linearIndex] = insideCount;
+}
+
+kernel void avbd_finalize_mesh_sdf(
+    texture3d<float, access::read_write> sdfTexture [[texture(0)]],
+    device const uint *insideCounts [[buffer(0)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= sdfTexture.get_width() || gid.y >= sdfTexture.get_height() || gid.z >= sdfTexture.get_depth()) {
+        return;
+    }
+
+    uint width = sdfTexture.get_width();
+    uint height = sdfTexture.get_height();
+    uint linearIndex = gid.x + gid.y * width + gid.z * width * height;
+    float sdfValue = sdfTexture.read(gid).r;
+    if (!isfinite(sdfValue)) {
+        sdfValue = FLT_MAX;
+    }
+    if ((insideCounts[linearIndex] & 1u) != 0u) {
+        sdfValue = -sdfValue;
+    }
+    sdfTexture.write(sdfValue, gid);
+}
+
+kernel void avbd_broadphase_primitive_mesh(
+    device const AVBDGPUBody *bodies [[buffer(0)]],
+    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(1)]],
+    device AVBDGPUPrimitiveMeshPair *candidatePairs [[buffer(2)]],
+    device AVBDGPUPrimitiveMeshPairListState *candidateState [[buffer(3)]],
+    constant AVBDGPUSolverParams &params [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int bodyCount = params.bodyCount;
+    int meshCount = params.meshCount;
+    int pairCount = bodyCount * meshCount;
+    if (tid >= uint(pairCount) || bodyCount <= 0 || meshCount <= 0) return;
+
+    int bodyIndex = int(tid) / meshCount;
+    int meshIndex = int(tid) - bodyIndex * meshCount;
+
+    if (meshInfos[meshIndex].ownerBodyIndex == bodyIndex) {
+        return;
+    }
+
+    float3 primitiveMin;
+    float3 primitiveMax;
+    make_body_aabb(bodies[bodyIndex], params, primitiveMin, primitiveMax);
+
+    float3 meshMin = meshInfos[meshIndex].minBounds.xyz;
+    float3 meshMax = meshInfos[meshIndex].maxBounds.xyz;
+    if (!aabb_overlaps(primitiveMin, primitiveMax, meshMin, meshMax)) {
+        return;
+    }
+
+    int baseIndex = 0;
+    if (reserve_primitive_mesh_pair_range(candidateState[0], 1, baseIndex) <= 0) {
+        return;
+    }
+
+    candidatePairs[baseIndex].bodyIndex = bodyIndex;
+    candidatePairs[baseIndex].meshIndex = meshIndex;
+}
+
+kernel void avbd_prepare_primitive_mesh_collision_indirect(
+    device AVBDGPUPrimitiveMeshPairListState *candidateState [[buffer(0)]],
+    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
+{
+    if (tid != 0) return;
+
+    int pairCount = min(atomic_load_explicit(&candidateState[0].count, memory_order_relaxed), candidateState[0].capacity);
+    uint threadgroupsX = uint(max(pairCount, 0) + simd_size - 1) / simd_size;
+    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
+    indirectArgs[0].threadgroupsPerGrid[1] = 1;
+    indirectArgs[0].threadgroupsPerGrid[2] = 1;
+}
+
+kernel void avbd_broadphase_mesh_mesh(
+    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(0)]],
+    device AVBDGPUMeshMeshPair *candidatePairs [[buffer(1)]],
+    device AVBDGPUMeshMeshPairListState *candidateState [[buffer(2)]],
+    constant AVBDGPUSolverParams &params [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int meshCount = params.meshCount;
+    int pairCount = meshCount * meshCount;
+    if (tid >= uint(pairCount) || meshCount <= 1) return;
+
+    int meshIndexA = int(tid) / meshCount;
+    int meshIndexB = int(tid) - meshIndexA * meshCount;
+    if (meshIndexA >= meshIndexB) {
+        return;
+    }
+
+    float3 minA = meshInfos[meshIndexA].minBounds.xyz;
+    float3 maxA = meshInfos[meshIndexA].maxBounds.xyz;
+    float3 minB = meshInfos[meshIndexB].minBounds.xyz;
+    float3 maxB = meshInfos[meshIndexB].maxBounds.xyz;
+    if (!aabb_overlaps(minA, maxA, minB, maxB)) {
+        return;
+    }
+
+    int baseIndex = 0;
+    if (reserve_mesh_mesh_pair_range(candidateState[0], 1, baseIndex) <= 0) {
+        return;
+    }
+
+    candidatePairs[baseIndex].meshIndexA = meshIndexA;
+    candidatePairs[baseIndex].meshIndexB = meshIndexB;
+}
+
+kernel void avbd_prepare_mesh_mesh_collision_indirect(
+    device AVBDGPUMeshMeshPairListState *candidateState [[buffer(0)]],
+    device AVBDGPUIndirectDispatchArgs *indirectArgs [[buffer(1)]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
+{
+    if (tid != 0) return;
+
+    int pairCount = min(atomic_load_explicit(&candidateState[0].count, memory_order_relaxed), candidateState[0].capacity);
+    uint threadgroupsX = uint(max(pairCount, 0) + simd_size - 1) / simd_size;
+    indirectArgs[0].threadgroupsPerGrid[0] = threadgroupsX;
+    indirectArgs[0].threadgroupsPerGrid[1] = 1;
+    indirectArgs[0].threadgroupsPerGrid[2] = 1;
+}
+
+kernel void avbd_collide_mesh_mesh(
+    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(0)]],
+    device const AVBDGPUMeshMeshPair *candidatePairs [[buffer(1)]],
+    device AVBDGPUMeshMeshPairListState *candidateState [[buffer(2)]],
+    constant AVBDGPUSolverParams &params [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int candidateCount = min(atomic_load_explicit(&candidateState[0].count, memory_order_relaxed), candidateState[0].capacity);
+    if (tid >= uint(candidateCount)) return;
+
+    const device AVBDGPUMeshMeshPair &pair = candidatePairs[tid];
+    if (pair.meshIndexA < 0 || pair.meshIndexA >= params.meshCount ||
+        pair.meshIndexB < 0 || pair.meshIndexB >= params.meshCount) {
+        return;
+    }
+
+    float3 minA = meshInfos[pair.meshIndexA].minBounds.xyz;
+    float3 maxA = meshInfos[pair.meshIndexA].maxBounds.xyz;
+    float3 minB = meshInfos[pair.meshIndexB].minBounds.xyz;
+    float3 maxB = meshInfos[pair.meshIndexB].maxBounds.xyz;
+    if (!aabb_overlaps(minA, maxA, minB, maxB)) {
+        return;
+    }
+}
+
+kernel void avbd_collide_primitive_mesh(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(1)]],
+    device const AVBDGPUPrimitiveMeshPair *candidatePairs [[buffer(2)]],
+    device AVBDGPUPrimitiveMeshPairListState *candidateState [[buffer(3)]],
+    constant AVBDGPUSolverParams &params [[buffer(4)]],
+    device const float3 *meshVertices [[buffer(5)]],
+    device const uint *meshIndices [[buffer(6)]],
+    device AVBDGPUManifold *manifolds [[buffer(7)]],
+    device AVBDGPUContact *allContacts [[buffer(8)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(9)]],
+    device int *activeManifoldIndices [[buffer(10)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(11)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
+{
+    int candidateCount = min(atomic_load_explicit(&candidateState[0].count, memory_order_relaxed), candidateState[0].capacity);
+    bool validThread = tid < uint(candidateCount);
+
+    int manifoldSlot = -1;
+    int bodyIndex = -1;
+    int bestMeshIndex = -1;
+    float bestSignedDistance = FLT_MAX;
+    AVBDGPUContactBuilderMetal builder;
+    builder.count = 0;
+    Mat3 basis = Mat3::identity();
+
+    if (validThread) {
+        const device AVBDGPUPrimitiveMeshPair &candidate = candidatePairs[tid];
+        bodyIndex = candidate.bodyIndex;
+        if (bodyIndex < 0 || bodyIndex >= params.bodyCount) {
+            validThread = false;
+        }
+    }
+
+    if (validThread) {
+        const device AVBDGPUPrimitiveMeshPair &candidate = candidatePairs[tid];
+        manifoldSlot = params.primitiveMeshManifoldOffset + int(tid);
+        device AVBDGPUBody &body = bodies[bodyIndex];
+        int meshOwnerBodyIndex = meshInfos[candidate.meshIndex].ownerBodyIndex;
+        device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+        manifold.bodyA = bodyIndex;
+        manifold.bodyB = meshOwnerBodyIndex >= 0 ? meshOwnerBodyIndex : -(candidate.meshIndex + 1);
+        manifold.contactCount = 0;
+        manifold.contactBaseIndex = -1;
+        manifold.active = 0;
+        manifold.friction = meshOwnerBodyIndex >= 0 ? 0.5f * (body.friction + bodies[meshOwnerBodyIndex].friction) : body.friction;
+        manifold.basisR0 = float3(1, 0, 0);
+        manifold.basisR1 = float3(0, 1, 0);
+        manifold.basisR2 = float3(0, 0, 1);
+
+        if (body.mass > 0.0f) {
+            float3 center = body.positionLin;
+
+            const device AVBDGPUCollisionMeshInfo &meshInfo = meshInfos[candidate.meshIndex];
+            if (candidate.meshIndex >= 0 && candidate.meshIndex < params.meshCount) {
+                if (meshInfo.indexCount < 3 || meshInfo.vertexCount < 3) {
+                    validThread = false;
+                }
+            } else {
+                validThread = false;
+            }
+
+            if (validThread) {
+                float3 meshCenter = 0.5f * (meshInfo.minBounds.xyz + meshInfo.maxBounds.xyz);
+                float3 samplePoints[AVBD_MAX_CONTACTS_PER_PAIR];
+                int sampleSeeds[AVBD_MAX_CONTACTS_PER_PAIR];
+                int sampleCount = 0;
+                build_primitive_mesh_sample_points(body, meshCenter, params, samplePoints, sampleSeeds, sampleCount);
+                float bodyExtent = body_radius(body, params);
+                float maxDistance = length(meshInfo.maxBounds.xyz - meshInfo.minBounds.xyz)
+                    + bodyExtent * 2.0f
+                    + params.collisionMargin
+                    + 1.0e-2f;
+
+                for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+                    float3 primitivePoint = samplePoints[sampleIndex];
+                    float3 castDirection = safe_normalize(meshCenter - primitivePoint, safe_normalize(meshCenter - center, float3(0.0f, 1.0f, 0.0f)));
+                    float3 rayOrigin = primitivePoint - castDirection * max(1.0e-3f, params.collisionMargin + 1.0e-3f);
+
+                    bool foundHit = false;
+                    float bestTriangleT = FLT_MAX;
+                    float3 bestTriangleHit = float3(0.0f);
+                    float3 bestTriangleNormal = float3(0.0f, 1.0f, 0.0f);
+                    int bestTriangleIndex = -1;
+
+                    int triangleCount = meshInfo.indexCount / 3;
+                    for (int triangleIndex = 0; triangleIndex < triangleCount; ++triangleIndex) {
+                        int indexBase = meshInfo.indexOffset + triangleIndex * 3;
+                        uint i0 = meshIndices[indexBase + 0];
+                        uint i1 = meshIndices[indexBase + 1];
+                        uint i2 = meshIndices[indexBase + 2];
+                        float3 v0 = (meshInfo.sdfTransform * float4(meshVertices[i0], 1.0f)).xyz;
+                        float3 v1 = (meshInfo.sdfTransform * float4(meshVertices[i1], 1.0f)).xyz;
+                        float3 v2 = (meshInfo.sdfTransform * float4(meshVertices[i2], 1.0f)).xyz;
+                        float hitT;
+                        float3 hitNormal;
+                        if (!ray_triangle_intersection(rayOrigin,
+                                                       castDirection,
+                                                       maxDistance,
+                                                       v0,
+                                                       v1,
+                                                       v2,
+                                                       hitT,
+                                                       hitNormal)) {
+                            continue;
+                        }
+
+                        if (!foundHit || hitT < bestTriangleT) {
+                            foundHit = true;
+                            bestTriangleT = hitT;
+                            bestTriangleHit = rayOrigin + castDirection * hitT;
+                            bestTriangleNormal = hitNormal;
+                            bestTriangleIndex = triangleIndex;
+                        }
+                    }
+
+                    if (!foundHit) {
+                        continue;
+                    }
+
+                    float3 outwardNormal = bestTriangleNormal;
+                    if (dot(outwardNormal, primitivePoint - bestTriangleHit) < 0.0f) {
+                        outwardNormal = -outwardNormal;
+                    }
+
+                    float signedDistance = dot(primitivePoint - bestTriangleHit, outwardNormal);
+                    if (signedDistance >= params.collisionMargin) {
+                        continue;
+                    }
+
+                    append_mesh_contact(
+                        builder,
+                        body,
+                        primitivePoint,
+                        bestTriangleHit,
+                        primitive_mesh_feature_key(candidate.meshIndex, bestTriangleIndex, sampleSeeds[sampleIndex])
+                    );
+
+                    if (signedDistance < bestSignedDistance) {
+                        bestSignedDistance = signedDistance;
+                        bestMeshIndex = candidate.meshIndex;
+                        basis = orthonormal_basis(outwardNormal);
+                    }
+                }
+            }
+        }
+
+        if (bestMeshIndex >= 0 && builder.count > 0) {
+            finalize_builder_mesh_contacts(body, builder, basis, params.collisionMargin);
+            manifold.bodyB = -(bestMeshIndex + 1);
+            manifold.friction = body.friction;
+            manifold.basisR0 = basis.r0;
+            manifold.basisR1 = basis.r1;
+            manifold.basisR2 = basis.r2;
+        }
+    }
+
+    int myContactOffset = simd_prefix_exclusive_sum(builder.count);
+    int totalContacts = simd_broadcast(myContactOffset + builder.count, simd_size - 1);
+
+    int contactBatchBaseIndex = 0;
+    int contactBatchGrantedCount = 0;
+    if (lid == 0 && totalContacts > 0) {
+        contactBatchGrantedCount = reserve_contact_range(contactAllocator[0], totalContacts, contactBatchBaseIndex);
+    }
+    contactBatchBaseIndex = simd_broadcast(contactBatchBaseIndex, 0);
+    contactBatchGrantedCount = simd_broadcast(contactBatchGrantedCount, 0);
+
+    bool shouldEmitActiveManifold = false;
+    if (validThread && manifoldSlot >= 0 && builder.count > 0) {
+        int myGrantedContacts = min(builder.count, max(contactBatchGrantedCount - myContactOffset, 0));
+
+        if (myGrantedContacts > 0) {
+            device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+            manifold.contactBaseIndex = contactBatchBaseIndex + myContactOffset;
+            manifold.contactCount = myGrantedContacts;
+            manifold.active = 1;
+            shouldEmitActiveManifold = true;
+            for (int i = 0; i < myGrantedContacts; i++) {
+                allContacts[manifold.contactBaseIndex + i] = builder.contacts[i];
+            }
+        }
+    }
+
+    int myActiveRank = simd_prefix_exclusive_sum(shouldEmitActiveManifold ? 1 : 0);
+    int totalActive = simd_broadcast(myActiveRank + (shouldEmitActiveManifold ? 1 : 0), simd_size - 1);
+
+    int activeManifoldBaseIndex = 0;
+    int activeManifoldGrantedCount = 0;
+    if (lid == 0 && totalActive > 0) {
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], totalActive, activeManifoldBaseIndex);
+    }
+    activeManifoldBaseIndex = simd_broadcast(activeManifoldBaseIndex, 0);
+    activeManifoldGrantedCount = simd_broadcast(activeManifoldGrantedCount, 0);
+
+    if (shouldEmitActiveManifold && myActiveRank < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + myActiveRank] = manifoldSlot;
+    }
+}
+
+kernel void avbd_collide_primitive_mesh_sdf(
+    device AVBDGPUBody *bodies [[buffer(0)]],
+    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(1)]],
+    device const AVBDGPUPrimitiveMeshPair *candidatePairs [[buffer(2)]],
+    device AVBDGPUPrimitiveMeshPairListState *candidateState [[buffer(3)]],
+    constant AVBDGPUSolverParams &params [[buffer(4)]],
+    device const float3 *meshVertices [[buffer(5)]],
+    device const uint *meshIndices [[buffer(6)]],
+    device AVBDGPUManifold *manifolds [[buffer(7)]],
+    device AVBDGPUContact *allContacts [[buffer(8)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(9)]],
+    device int *activeManifoldIndices [[buffer(10)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(11)]],
+    constant AVBDCollisionMeshSDFSet &meshSDFSet [[buffer(12)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
+{
+    int candidateCount = min(atomic_load_explicit(&candidateState[0].count, memory_order_relaxed), candidateState[0].capacity);
+    bool validThread = tid < uint(candidateCount);
+
+    int manifoldSlot = -1;
+    int bodyIndex = -1;
+    int bestMeshIndex = -1;
+    float bestSignedDistance = FLT_MAX;
+    AVBDGPUContactBuilderMetal builder;
+    builder.count = 0;
+    Mat3 basis = Mat3::identity();
+
+    if (validThread) {
+        const device AVBDGPUPrimitiveMeshPair &candidate = candidatePairs[tid];
+        bodyIndex = candidate.bodyIndex;
+        if (bodyIndex < 0 || bodyIndex >= params.bodyCount) {
+            validThread = false;
+        }
+    }
+
+    if (validThread) {
+        const device AVBDGPUPrimitiveMeshPair &candidate = candidatePairs[tid];
+        manifoldSlot = params.primitiveMeshManifoldOffset + int(tid);
+        device AVBDGPUBody &body = bodies[bodyIndex];
+        int meshOwnerBodyIndex = meshInfos[candidate.meshIndex].ownerBodyIndex;
+        device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+        manifold.bodyA = bodyIndex;
+        manifold.bodyB = meshOwnerBodyIndex >= 0 ? meshOwnerBodyIndex : -(candidate.meshIndex + 1);
+        manifold.contactCount = 0;
+        manifold.contactBaseIndex = -1;
+        manifold.active = 0;
+        manifold.friction = meshOwnerBodyIndex >= 0 ? 0.5f * (body.friction + bodies[meshOwnerBodyIndex].friction) : body.friction;
+        manifold.basisR0 = float3(1, 0, 0);
+        manifold.basisR1 = float3(0, 1, 0);
+        manifold.basisR2 = float3(0, 0, 1);
+
+        if (body.mass > 0.0f) {
+            const device AVBDGPUCollisionMeshInfo &candidateMeshInfo = meshInfos[candidate.meshIndex];
+            if (candidate.meshIndex >= 0 && candidate.meshIndex < params.meshCount) {
+                if (candidateMeshInfo.indexCount < 3 || candidateMeshInfo.vertexCount < 3) {
+                    validThread = false;
+                }
+            } else {
+                validThread = false;
+            }
+
+            if (validThread) {
+                float3 meshCenter = 0.5f * (candidateMeshInfo.minBounds.xyz + candidateMeshInfo.maxBounds.xyz);
+                float3 samplePoints[AVBD_MAX_CONTACTS_PER_PAIR];
+                int sampleSeeds[AVBD_MAX_CONTACTS_PER_PAIR];
+                int sampleCount = 0;
+                build_primitive_mesh_sample_points(body, meshCenter, params, samplePoints, sampleSeeds, sampleCount);
+                int sdfResourceIndex = candidateMeshInfo.sdfResourceIndex;
+                if (sdfResourceIndex < 0 || sdfResourceIndex >= AVBD_MAX_COLLISION_MESH_SDFS) {
+                    validThread = false;
+                } else {
+                    texture3d<float, access::sample> sdfTexture = meshSDFSet.sdf[sdfResourceIndex];
+
+                    for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+                        float3 primitivePoint = samplePoints[sampleIndex];
+                        float4 worldPoint4 = candidateMeshInfo.sdfInvTransform * float4(primitivePoint, 1.0f);
+                        float3 pointLocal = worldPoint4.xyz;
+                        if (!point_in_collision_mesh_sdf_bounds(pointLocal, candidateMeshInfo)) {
+                            continue;
+                        }
+
+                        float signedDistance = sample_collision_mesh_sdf_value(sdfTexture, pointLocal, candidateMeshInfo);
+                        if (!isfinite(signedDistance) || signedDistance >= params.collisionMargin) {
+                            continue;
+                        }
+
+                        float3 localNormal = collision_mesh_sdf_local_normal(sdfTexture, pointLocal, candidateMeshInfo);
+                        float3 outwardNormal = collision_mesh_sdf_world_normal(localNormal, candidateMeshInfo);
+                        float3 localSurfacePoint = pointLocal - localNormal * signedDistance;
+                        float4 worldSurfacePoint4 = candidateMeshInfo.sdfTransform * float4(localSurfacePoint, 1.0f);
+                        float3 bestSurfacePoint = worldSurfacePoint4.xyz;
+
+                        if (meshOwnerBodyIndex >= 0) {
+                            append_primitive_mesh_contact(
+                                builder,
+                                body,
+                                bodies[meshOwnerBodyIndex],
+                                primitivePoint,
+                                bestSurfacePoint,
+                                primitive_mesh_feature_key(candidate.meshIndex, sampleSeeds[sampleIndex], 0)
+                            );
+                        } else {
+                            append_mesh_contact(
+                                builder,
+                                body,
+                                primitivePoint,
+                                bestSurfacePoint,
+                                primitive_mesh_feature_key(candidate.meshIndex, sampleSeeds[sampleIndex], 0)
+                            );
+                        }
+
+                        if (signedDistance < bestSignedDistance) {
+                            bestSignedDistance = signedDistance;
+                            bestMeshIndex = candidate.meshIndex;
+                            basis = orthonormal_basis(outwardNormal);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bestMeshIndex >= 0 && builder.count > 0) {
+            if (meshOwnerBodyIndex >= 0) {
+                finalize_builder_contacts(body, bodies[meshOwnerBodyIndex], builder, basis, params.collisionMargin);
+                manifold.bodyB = meshOwnerBodyIndex;
+                manifold.friction = 0.5f * (body.friction + bodies[meshOwnerBodyIndex].friction);
+            } else {
+                finalize_builder_mesh_contacts(body, builder, basis, params.collisionMargin);
+                manifold.bodyB = -(bestMeshIndex + 1);
+                manifold.friction = body.friction;
+            }
+            manifold.basisR0 = basis.r0;
+            manifold.basisR1 = basis.r1;
+            manifold.basisR2 = basis.r2;
+        }
+    }
+
+    int myContactOffset = simd_prefix_exclusive_sum(builder.count);
+    int totalContacts = simd_broadcast(myContactOffset + builder.count, simd_size - 1);
+
+    int contactBatchBaseIndex = 0;
+    int contactBatchGrantedCount = 0;
+    if (lid == 0 && totalContacts > 0) {
+        contactBatchGrantedCount = reserve_contact_range(contactAllocator[0], totalContacts, contactBatchBaseIndex);
+    }
+    contactBatchBaseIndex = simd_broadcast(contactBatchBaseIndex, 0);
+    contactBatchGrantedCount = simd_broadcast(contactBatchGrantedCount, 0);
+
+    bool shouldEmitActiveManifold = false;
+    if (validThread && manifoldSlot >= 0 && builder.count > 0) {
+        int myGrantedContacts = min(builder.count, max(contactBatchGrantedCount - myContactOffset, 0));
+
+        if (myGrantedContacts > 0) {
+            device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+            manifold.contactBaseIndex = contactBatchBaseIndex + myContactOffset;
+            manifold.contactCount = myGrantedContacts;
+            manifold.active = 1;
+            shouldEmitActiveManifold = true;
+            for (int i = 0; i < myGrantedContacts; i++) {
+                allContacts[manifold.contactBaseIndex + i] = builder.contacts[i];
+            }
+        }
+    }
+
+    int myActiveRank = simd_prefix_exclusive_sum(shouldEmitActiveManifold ? 1 : 0);
+    int totalActive = simd_broadcast(myActiveRank + (shouldEmitActiveManifold ? 1 : 0), simd_size - 1);
+
+    int activeManifoldBaseIndex = 0;
+    int activeManifoldGrantedCount = 0;
+    if (lid == 0 && totalActive > 0) {
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], totalActive, activeManifoldBaseIndex);
+    }
+    activeManifoldBaseIndex = simd_broadcast(activeManifoldBaseIndex, 0);
+    activeManifoldGrantedCount = simd_broadcast(activeManifoldGrantedCount, 0);
+
+    if (shouldEmitActiveManifold && myActiveRank < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + myActiveRank] = manifoldSlot;
+    }
+}
+
 kernel void avbd_build_adjacency_constraints(
     device AVBDGPUJoint *joints [[buffer(0)]],
     device AVBDGPUSpring *springs [[buffer(1)]],
@@ -1597,7 +2569,9 @@ kernel void avbd_build_adjacency_manifolds(
     int manifoldIndex = activeManifoldIndices[tid];
     device AVBDGPUManifold &m = manifolds[manifoldIndex];
     add_manifold_adjacency(adjacency, m.bodyA, manifoldIndex);
-    add_manifold_adjacency(adjacency, m.bodyB, manifoldIndex);
+    if (m.bodyB >= 0) {
+        add_manifold_adjacency(adjacency, m.bodyB, manifoldIndex);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1846,26 +2820,32 @@ kernel void avbd_body_solve(
 
         Mat3 basis(m.basisR0, m.basisR1, m.basisR2);
         bool isBodyA = (m.bodyA == int(tid));
+        bool bodyBIsMesh = m.bodyB < 0;
 
         device AVBDGPUBody &bA = bodies[m.bodyA];
-        device AVBDGPUBody &bB = bodies[m.bodyB];
-
         float3 dqALin = bA.positionLin - bA.initialLin;
         float3 dqAAng = quat_delta(bA.positionAng, bA.initialAng);
-        float3 dqBLin = bB.positionLin - bB.initialLin;
-        float3 dqBAng = quat_delta(bB.positionAng, bB.initialAng);
+        float3 dqBLin = float3(0.0f);
+        float3 dqBAng = float3(0.0f);
+        float4 bBQuat = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        if (!bodyBIsMesh) {
+            device AVBDGPUBody &bB = bodies[m.bodyB];
+            dqBLin = bB.positionLin - bB.initialLin;
+            dqBAng = quat_delta(bB.positionAng, bB.initialAng);
+            bBQuat = bB.positionAng;
+        }
 
         for (int ci = 0; ci < m.contactCount; ci++) {
             device AVBDGPUContact &ct = allContacts[m.contactBaseIndex + ci];
             if (!ct.active) continue;
 
             float3 rAWorld = quat_act(bA.positionAng, ct.rA);
-            float3 rBWorld = quat_act(bB.positionAng, ct.rB);
+            float3 rBWorld = bodyBIsMesh ? ct.rB : quat_act(bBQuat, ct.rB);
 
             Mat3 jALin = basis;
-            Mat3 jBLin = basis * (-1.0f);
+            Mat3 jBLin = bodyBIsMesh ? Mat3(float3(0.0f), float3(0.0f), float3(0.0f)) : basis * (-1.0f);
             Mat3 jAAng = Mat3(cross(rAWorld, jALin.r0), cross(rAWorld, jALin.r1), cross(rAWorld, jALin.r2));
-            Mat3 jBAng = Mat3(cross(rBWorld, jBLin.r0), cross(rBWorld, jBLin.r1), cross(rBWorld, jBLin.r2));
+            Mat3 jBAng = bodyBIsMesh ? Mat3(float3(0.0f), float3(0.0f), float3(0.0f)) : Mat3(cross(rBWorld, jBLin.r0), cross(rBWorld, jBLin.r1), cross(rBWorld, jBLin.r2));
 
             Mat3 K = Mat3::diag3(ct.penalty);
             float3 C_ct = ct.C0 * (1.0f - alpha)
@@ -1991,14 +2971,21 @@ kernel void avbd_dual_update_manifolds(
     device AVBDGPUManifold &m = manifolds[activeManifoldIndices[tid]];
 
     device AVBDGPUBody &bA = bodies[m.bodyA];
-    device AVBDGPUBody &bB = bodies[m.bodyB];
+    bool bodyBIsMesh = m.bodyB < 0;
 
     Mat3 basis(m.basisR0, m.basisR1, m.basisR2);
 
     float3 dqALin = bA.positionLin - bA.initialLin;
     float3 dqAAng = quat_delta(bA.positionAng, bA.initialAng);
-    float3 dqBLin = bB.positionLin - bB.initialLin;
-    float3 dqBAng = quat_delta(bB.positionAng, bB.initialAng);
+    float3 dqBLin = float3(0.0f);
+    float3 dqBAng = float3(0.0f);
+    float4 bBQuat = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    if (!bodyBIsMesh) {
+        device AVBDGPUBody &bB = bodies[m.bodyB];
+        dqBLin = bB.positionLin - bB.initialLin;
+        dqBAng = quat_delta(bB.positionAng, bB.initialAng);
+        bBQuat = bB.positionAng;
+    }
 
     float alpha = params.alpha;
 
@@ -2007,12 +2994,12 @@ kernel void avbd_dual_update_manifolds(
         if (!ct.active) continue;
 
         float3 rAWorld = quat_act(bA.positionAng, ct.rA);
-        float3 rBWorld = quat_act(bB.positionAng, ct.rB);
+        float3 rBWorld = bodyBIsMesh ? ct.rB : quat_act(bBQuat, ct.rB);
 
         Mat3 jALin = basis;
-        Mat3 jBLin = basis * (-1.0f);
+        Mat3 jBLin = bodyBIsMesh ? Mat3(float3(0.0f), float3(0.0f), float3(0.0f)) : basis * (-1.0f);
         Mat3 jAAng = Mat3(cross(rAWorld, jALin.r0), cross(rAWorld, jALin.r1), cross(rAWorld, jALin.r2));
-        Mat3 jBAng = Mat3(cross(rBWorld, jBLin.r0), cross(rBWorld, jBLin.r1), cross(rBWorld, jBLin.r2));
+        Mat3 jBAng = bodyBIsMesh ? Mat3(float3(0.0f), float3(0.0f), float3(0.0f)) : Mat3(cross(rBWorld, jBLin.r0), cross(rBWorld, jBLin.r1), cross(rBWorld, jBLin.r2));
 
         Mat3 K = Mat3::diag3(ct.penalty);
         float3 C = ct.C0 * (1.0f - alpha)
@@ -2053,11 +3040,15 @@ kernel void avbd_finalize(
 
     device AVBDGPUBody &b = bodies[tid];
     float dt = params.dt;
+    float linearDampingFactor = damping_factor(params.linearDamping, dt);
+    float angularDampingFactor = damping_factor(params.angularDamping, dt);
 
     b.prevVelocityLin = b.velocityLin;
     if (b.mass > 0.0f) {
         b.velocityLin = (b.positionLin - b.initialLin) / dt;
         b.velocityAng = quat_delta(b.positionAng, b.initialAng) / dt;
+        b.velocityLin *= linearDampingFactor;
+        b.velocityAng *= angularDampingFactor;
     }
 }
 
@@ -2101,6 +3092,7 @@ kernel void avbd_warmstart_contacts(
 
     device AVBDGPUManifold &pm = prevManifolds[prevMatchIdx];
     Mat3 basis(m.basisR0, m.basisR1, m.basisR2);
+    bool bodyBIsMesh = m.bodyB < 0;
 
     for (int ci = 0; ci < m.contactCount; ci++) {
         device AVBDGPUContact &ct = contacts[m.contactBaseIndex + ci];
@@ -2118,16 +3110,23 @@ kernel void avbd_warmstart_contacts(
 
             if (pct.stick) {
                 ct.rA = pct.rA;
-                ct.rB = pct.rB;
+                if (!bodyBIsMesh) {
+                    ct.rB = pct.rB;
+                }
                 ct.stick = pct.stick;
                 // Recompute C0 with old rA/rB and current body positions
                 device AVBDGPUBody &bA = bodies[m.bodyA];
-                device AVBDGPUBody &bB = bodies[m.bodyB];
                 float3 xA = quat_act(bA.positionAng, ct.rA) + bA.positionLin;
-                float3 xB = quat_act(bB.positionAng, ct.rB) + bB.positionLin;
+                float3 xB;
+                if (bodyBIsMesh) {
+                    xB = ct.rB;
+                } else {
+                    device AVBDGPUBody &bB = bodies[m.bodyB];
+                    xB = quat_act(bB.positionAng, ct.rB) + bB.positionLin;
+                }
                 float3 diff = xA - xB;
                 ct.C0 = float3(dot(basis.r0, diff), dot(basis.r1, diff), dot(basis.r2, diff))
-                       + float3(params.collisionMargin, 0, 0);
+                    + float3(params.collisionMargin, 0, 0);
             }
             break;
         }

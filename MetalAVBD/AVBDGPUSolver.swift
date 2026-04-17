@@ -7,7 +7,9 @@
 //  Broadphase collision detection and contact generation also run on GPU.
 //
 
+import Foundation
 import Metal
+import QuartzCore
 import simd
 
 private let SWIFT_AVBD_MAX_CONTACTS_PER_PAIR = Int(AVBD_MAX_CONTACTS_PER_PAIR)
@@ -24,6 +26,9 @@ private let gpuPlaneEpsilon: Float = Float(AVBD_COLLISION_PLANE_EPSILON)
 private let gpuContactMergeDistSq: Float = Float(AVBD_COLLISION_CONTACT_MERGE_DIST_SQ)
 private let gpuNilRenderColor = SIMD4<Float>(0, 0, 0, -1)
 private let gpuNilColorGroup: Int32 = Int32.min
+private let gpuCollisionMeshSDFLongestAxisResolution: Int32 = 64
+private let gpuCollisionMeshSDFTriangleChunkSize = 1024
+private let gpuMaxCollisionMeshSDFs = Int(AVBD_MAX_COLLISION_MESH_SDFS)
 
 private struct AVBDGPUOBB {
     var center: SIMD3<Float>
@@ -50,8 +55,41 @@ private struct AVBDGPUFaceFrame {
     var extentV: Float = 0
 }
 
+struct AVBDCollisionMeshBroadphaseMesh {
+    var sdfResourceID: String = ""
+    var ownerBodyIndex: Int = -1
+    var localBoundsMin: SIMD3<Float>
+    var localBoundsMax: SIMD3<Float>
+    var transform: simd_float4x4 = matrix_identity_float4x4
+    var positions: [SIMD3<Float>] = []
+    var indices: [UInt32] = []
+}
+
 final class AVBDGPUSolver {
+    private struct CachedCollisionMeshSDF {
+        var texture: MTLTexture
+    }
+
+    private struct CollisionMeshGeometryResource {
+        var vertexOffset: Int
+        var vertexCount: Int
+        var indexOffset: Int
+        var indexCount: Int
+    }
+
+    private static var collisionMeshSDFCache: [String: CachedCollisionMeshSDF] = [:]
+    private static let collisionMeshSDFCacheLock = NSLock()
+
     let device: MTLDevice
+    private let collisionMeshSDFCommandQueue: MTLCommandQueue?
+    private let collisionMeshSDFArgumentEncoder: MTLArgumentEncoder?
+    private var collisionMeshSDFArgumentBuffer: MTLBuffer?
+    private var collisionMeshSDFTextures: [MTLTexture] = []
+    private var collisionMeshGeometryResources: [String: CollisionMeshGeometryResource] = [:]
+    private var collisionMeshSDFResourceIndicesByKey: [String: Int] = [:]
+    private var collisionMeshVertexCountUsed = 0
+    private var collisionMeshIndexCountUsed = 0
+    private(set) var collisionMeshSDFStatusText: String = "Idle"
 
     // Compute pipelines
     private let forwardIntegratePSO: MTLComputePipelineState
@@ -61,6 +99,16 @@ final class AVBDGPUSolver {
     private let prepareBroadphaseIndirectPSO: MTLComputePipelineState
     private let buildPrimitiveManifoldsPSO: MTLComputePipelineState
     private let prepareActiveManifoldsIndirectPSO: MTLComputePipelineState
+    private let primitiveMeshBroadphasePSO: MTLComputePipelineState
+    private let preparePrimitiveMeshCollisionIndirectPSO: MTLComputePipelineState
+    private let collidePrimitiveMeshPSO: MTLComputePipelineState
+    private let collidePrimitiveMeshSDFPSO: MTLComputePipelineState
+    private let initializeCollisionMeshSDFPSO: MTLComputePipelineState
+    private let accumulateCollisionMeshSDFPSO: MTLComputePipelineState
+    private let finalizeCollisionMeshSDFPSO: MTLComputePipelineState
+    private let meshMeshBroadphasePSO: MTLComputePipelineState
+    private let prepareMeshMeshCollisionIndirectPSO: MTLComputePipelineState
+    private let collideMeshMeshPSO: MTLComputePipelineState
     private let buildAdjacencyConstraintsPSO: MTLComputePipelineState
     private let buildAdjacencyManifoldsPSO: MTLComputePipelineState
     private let initJointsPSO: MTLComputePipelineState
@@ -79,6 +127,8 @@ final class AVBDGPUSolver {
     var betaLin: Float = 100_000.0
     var betaAng: Float = 100.0
     var gamma: Float = 0.999
+    var linearDamping: Float = 0.0
+    var angularDamping: Float = 0.0
     private var _broadphaseCacheMargin: Float = 0.1
     private var _broadphaseFullRefreshStepCount: Int = 60
 
@@ -131,10 +181,25 @@ final class AVBDGPUSolver {
     private var prevContactBuffer: MTLBuffer
     private var prevActiveManifoldIndexBuffer: MTLBuffer
     private var prevActiveManifoldStateBuffer: MTLBuffer
+    private var collisionMeshInfoBuffer: MTLBuffer
+    private var collisionMeshVertexBuffer: MTLBuffer
+    private var collisionMeshIndexBuffer: MTLBuffer
+    private var primitiveMeshPairBuffer: MTLBuffer
+    private var primitiveMeshPairStateBuffer: MTLBuffer
+    private var primitiveMeshPairIndirectBuffer: MTLBuffer
+    private var meshMeshPairBuffer: MTLBuffer
+    private var meshMeshPairStateBuffer: MTLBuffer
+    private var meshMeshPairIndirectBuffer: MTLBuffer
     private var paramsBuffer: MTLBuffer
     private var maxCollisions: Int
+    private var bodyBodyManifoldCapacity: Int
+    private var primitiveMeshManifoldCapacity: Int
     private var recentPairCapacity: Int
     private var contactCapacity: Int
+    private var collisionMeshCapacity: Int
+    private var collisionMeshCount: Int
+    private var primitiveMeshPairCapacity: Int
+    private var meshMeshPairCapacity: Int
     private var recentPairCacheSlot: Int
 
     // CPU-side setup/reference copies for static constraints and initial upload
@@ -178,7 +243,7 @@ final class AVBDGPUSolver {
         colorGroup == gpuNilColorGroup ? nil : Int(colorGroup)
     }
 
-    private func resolvedRenderColor(bodyIndex: Int) -> SIMD4<Float> {
+    func resolvedRenderColor(bodyIndex: Int) -> SIMD4<Float> {
         let renderColorPtr = renderColorBuffer.contents().bindMemory(to: SIMD4<Float>.self, capacity: bodyCapacity)
         let renderColorGroupPtr = renderColorGroupBuffer.contents().bindMemory(to: Int32.self, capacity: bodyCapacity)
         let body = cpuBodies[bodyIndex]
@@ -194,17 +259,342 @@ final class AVBDGPUSolver {
         )
     }
 
+    var collisionMeshDebugInfoBuffer: MTLBuffer? {
+        guard collisionMeshCount > 0 else { return nil }
+        return collisionMeshInfoBuffer
+    }
+
+    var collisionMeshDebugSDFArgumentBuffer: MTLBuffer? {
+        guard collisionMeshCount > 0,
+              !collisionMeshSDFTextures.isEmpty else {
+            return nil
+        }
+        return collisionMeshSDFArgumentBuffer
+    }
+
+    var collisionMeshDebugTextures: [MTLTexture] {
+        Array(collisionMeshSDFTextures.prefix(collisionMeshCount))
+    }
+
+    func collisionMeshInfoSnapshot() -> [AVBDGPUCollisionMeshInfo] {
+        guard collisionMeshCount > 0 else { return [] }
+        let infoPtr = collisionMeshInfoBuffer.contents().bindMemory(
+            to: AVBDGPUCollisionMeshInfo.self,
+            capacity: collisionMeshCount
+        )
+        return Array(UnsafeBufferPointer(start: infoPtr, count: collisionMeshCount))
+    }
+
+    private func ensureCollisionMeshLocalBufferCapacity(requiredVertexCount: Int, requiredIndexCount: Int) {
+        if collisionMeshVertexBuffer.length < MemoryLayout<SIMD3<Float>>.stride * max(requiredVertexCount, 1) {
+            let oldBuffer = collisionMeshVertexBuffer
+            collisionMeshVertexBuffer = device.makeBuffer(
+                length: MemoryLayout<SIMD3<Float>>.stride * max(requiredVertexCount, 1),
+                options: .storageModeShared
+            )!
+            if collisionMeshVertexCountUsed > 0 {
+                memcpy(collisionMeshVertexBuffer.contents(), oldBuffer.contents(), MemoryLayout<SIMD3<Float>>.stride * collisionMeshVertexCountUsed)
+            }
+        }
+
+        if collisionMeshIndexBuffer.length < MemoryLayout<UInt32>.stride * max(requiredIndexCount, 1) {
+            let oldBuffer = collisionMeshIndexBuffer
+            collisionMeshIndexBuffer = device.makeBuffer(
+                length: MemoryLayout<UInt32>.stride * max(requiredIndexCount, 1),
+                options: .storageModeShared
+            )!
+            if collisionMeshIndexCountUsed > 0 {
+                memcpy(collisionMeshIndexBuffer.contents(), oldBuffer.contents(), MemoryLayout<UInt32>.stride * collisionMeshIndexCountUsed)
+            }
+        }
+    }
+
+    private func updateCollisionMeshSDFArgumentBufferBindings() {
+        guard let collisionMeshSDFArgumentEncoder, !collisionMeshSDFTextures.isEmpty else {
+            return
+        }
+        if collisionMeshSDFArgumentBuffer == nil
+            || collisionMeshSDFArgumentBuffer!.length < collisionMeshSDFArgumentEncoder.encodedLength {
+            collisionMeshSDFArgumentBuffer = device.makeBuffer(
+                length: collisionMeshSDFArgumentEncoder.encodedLength,
+                options: .storageModeShared
+            )
+        }
+        if let collisionMeshSDFArgumentBuffer {
+            collisionMeshSDFArgumentEncoder.setArgumentBuffer(collisionMeshSDFArgumentBuffer, offset: 0)
+            for textureIndex in 0..<gpuMaxCollisionMeshSDFs {
+                let texture = textureIndex < collisionMeshSDFTextures.count ? collisionMeshSDFTextures[textureIndex] : nil
+                collisionMeshSDFArgumentEncoder.setTexture(texture, index: textureIndex)
+            }
+        }
+    }
+
+    private static func cachedCollisionMeshSDF(for key: String) -> CachedCollisionMeshSDF? {
+        collisionMeshSDFCacheLock.lock()
+        defer { collisionMeshSDFCacheLock.unlock() }
+        return collisionMeshSDFCache[key]
+    }
+
+    private static func storeCollisionMeshSDF(_ texture: MTLTexture, for key: String) {
+        collisionMeshSDFCacheLock.lock()
+        collisionMeshSDFCache[key] = CachedCollisionMeshSDF(texture: texture)
+        collisionMeshSDFCacheLock.unlock()
+    }
+
+    @discardableResult
+    func prepareCollisionMeshSDFCache(_ mesh: AVBDCollisionMeshBroadphaseMesh) -> Bool {
+        let sdfPadding = Self.collisionMeshSDFPadding(for: mesh)
+        let sdfLocalMinBounds = mesh.localBoundsMin - sdfPadding
+        let sdfLocalMaxBounds = mesh.localBoundsMax + sdfPadding
+        let sdfResolution = Self.collisionMeshSDFResolution(
+            localMinBounds: sdfLocalMinBounds,
+            localMaxBounds: sdfLocalMaxBounds
+        )
+        let resourceKey = Self.collisionMeshSDFCacheKey(
+            mesh: mesh,
+            localBoundsMin: sdfLocalMinBounds,
+            localBoundsMax: sdfLocalMaxBounds,
+            resolution: sdfResolution
+        )
+
+        if Self.cachedCollisionMeshSDF(for: resourceKey) != nil {
+            return true
+        }
+
+        guard let sdfTexture = buildCollisionMeshSDFTexture(
+            localVertices: mesh.positions,
+            indices: mesh.indices,
+            localBoundsMin: sdfLocalMinBounds,
+            localBoundsMax: sdfLocalMaxBounds,
+            resolution: sdfResolution
+        ) else {
+            return false
+        }
+
+        Self.storeCollisionMeshSDF(sdfTexture, for: resourceKey)
+        return true
+    }
+
+    @discardableResult
+    func prewarmCollisionMeshResource(_ mesh: AVBDCollisionMeshBroadphaseMesh) -> Bool {
+        let sdfPadding = Self.collisionMeshSDFPadding(for: mesh)
+        let sdfLocalMinBounds = mesh.localBoundsMin - sdfPadding
+        let sdfLocalMaxBounds = mesh.localBoundsMax + sdfPadding
+        let sdfResolution = Self.collisionMeshSDFResolution(
+            localMinBounds: sdfLocalMinBounds,
+            localMaxBounds: sdfLocalMaxBounds
+        )
+        let resourceKey = Self.collisionMeshSDFCacheKey(
+            mesh: mesh,
+            localBoundsMin: sdfLocalMinBounds,
+            localBoundsMax: sdfLocalMaxBounds,
+            resolution: sdfResolution
+        )
+
+        if collisionMeshGeometryResources[resourceKey] != nil,
+           collisionMeshSDFResourceIndicesByKey[resourceKey] != nil {
+            collisionMeshSDFStatusText = "Cached"
+            return true
+        }
+
+        if collisionMeshGeometryResources[resourceKey] == nil {
+            let vertexOffset = collisionMeshVertexCountUsed
+            let indexOffset = collisionMeshIndexCountUsed
+            ensureCollisionMeshLocalBufferCapacity(
+                requiredVertexCount: vertexOffset + mesh.positions.count,
+                requiredIndexCount: indexOffset + mesh.indices.count
+            )
+            let vertexPtr = collisionMeshVertexBuffer.contents().bindMemory(
+                to: SIMD3<Float>.self,
+                capacity: max(vertexOffset + mesh.positions.count, 1)
+            )
+            for vertexIndex in mesh.positions.indices {
+                vertexPtr[vertexOffset + vertexIndex] = mesh.positions[vertexIndex]
+            }
+            let indexPtr = collisionMeshIndexBuffer.contents().bindMemory(
+                to: UInt32.self,
+                capacity: max(indexOffset + mesh.indices.count, 1)
+            )
+            for index in mesh.indices.indices {
+                indexPtr[indexOffset + index] = UInt32(vertexOffset) + mesh.indices[index]
+            }
+            collisionMeshGeometryResources[resourceKey] = CollisionMeshGeometryResource(
+                vertexOffset: vertexOffset,
+                vertexCount: mesh.positions.count,
+                indexOffset: indexOffset,
+                indexCount: mesh.indices.count
+            )
+            collisionMeshVertexCountUsed += mesh.positions.count
+            collisionMeshIndexCountUsed += mesh.indices.count
+        }
+
+        if collisionMeshSDFResourceIndicesByKey[resourceKey] == nil {
+            let sdfTexture: MTLTexture?
+            if let cached = Self.cachedCollisionMeshSDF(for: resourceKey) {
+                sdfTexture = cached.texture
+            } else {
+                sdfTexture = buildCollisionMeshSDFTexture(
+                    localVertices: mesh.positions,
+                    indices: mesh.indices,
+                    localBoundsMin: sdfLocalMinBounds,
+                    localBoundsMax: sdfLocalMaxBounds,
+                    resolution: sdfResolution
+                )
+                if let sdfTexture {
+                    Self.storeCollisionMeshSDF(sdfTexture, for: resourceKey)
+                }
+            }
+
+            guard let sdfTexture else {
+                return false
+            }
+
+            collisionMeshSDFResourceIndicesByKey[resourceKey] = collisionMeshSDFTextures.count
+            collisionMeshSDFTextures.append(sdfTexture)
+            updateCollisionMeshSDFArgumentBufferBindings()
+        }
+
+        collisionMeshSDFStatusText = "Cached"
+        return true
+    }
+
+    @discardableResult
+    func updateCollisionMeshInstances(_ meshes: [AVBDCollisionMeshBroadphaseMesh]) -> Bool {
+        guard meshes.count == collisionMeshCount, collisionMeshCount > 0 else {
+            return false
+        }
+
+        let infoPtr = collisionMeshInfoBuffer.contents().bindMemory(
+            to: AVBDGPUCollisionMeshInfo.self,
+            capacity: max(collisionMeshCapacity, 1)
+        )
+
+        for meshIndex in 0..<collisionMeshCount {
+            let mesh = meshes[meshIndex]
+            var meshInfo = infoPtr[meshIndex]
+            if Int(meshInfo.vertexCount) != mesh.positions.count || Int(meshInfo.indexCount) != mesh.indices.count {
+                return false
+            }
+
+            let localMinBounds = SIMD3<Float>(
+                meshInfo.sdfLocalMinBounds.x,
+                meshInfo.sdfLocalMinBounds.y,
+                meshInfo.sdfLocalMinBounds.z
+            )
+            let localMaxBounds = SIMD3<Float>(
+                meshInfo.sdfLocalMaxBounds.x,
+                meshInfo.sdfLocalMaxBounds.y,
+                meshInfo.sdfLocalMaxBounds.z
+            )
+            let worldBounds = Self.transformedBounds(
+                localMinBounds: localMinBounds,
+                localMaxBounds: localMaxBounds,
+                transform: mesh.transform
+            )
+
+            meshInfo.ownerBodyIndex = Int32(mesh.ownerBodyIndex)
+            meshInfo.minBounds = SIMD4<Float>(worldBounds.min, 0)
+            meshInfo.maxBounds = SIMD4<Float>(worldBounds.max, 0)
+            meshInfo.sdfTransform = mesh.transform
+            meshInfo.sdfInvTransform = simd_inverse(mesh.transform)
+            infoPtr[meshIndex] = meshInfo
+        }
+
+        forceFullBroadphase = true
+        collisionMeshSDFStatusText = !collisionMeshSDFTextures.isEmpty ? "Cached" : "Idle"
+        return true
+    }
+
+    @discardableResult
+    func appendCollisionMeshInstance(_ mesh: AVBDCollisionMeshBroadphaseMesh) -> Bool {
+        guard collisionMeshCount < min(collisionMeshCapacity, gpuMaxCollisionMeshSDFs) else {
+            return false
+        }
+
+        let sdfPadding = Self.collisionMeshSDFPadding(for: mesh)
+        let sdfLocalMinBounds = mesh.localBoundsMin - sdfPadding
+        let sdfLocalMaxBounds = mesh.localBoundsMax + sdfPadding
+        let sdfResolution = Self.collisionMeshSDFResolution(
+            localMinBounds: sdfLocalMinBounds,
+            localMaxBounds: sdfLocalMaxBounds
+        )
+        let resourceKey = Self.collisionMeshSDFCacheKey(
+            mesh: mesh,
+            localBoundsMin: sdfLocalMinBounds,
+            localBoundsMax: sdfLocalMaxBounds,
+            resolution: sdfResolution
+        )
+
+        guard let geometryResource = collisionMeshGeometryResources[resourceKey],
+              let sdfResourceIndex = collisionMeshSDFResourceIndicesByKey[resourceKey] else {
+            return false
+        }
+
+        let worldBounds = Self.transformedBounds(
+            localMinBounds: sdfLocalMinBounds,
+            localMaxBounds: sdfLocalMaxBounds,
+            transform: mesh.transform
+        )
+        let sdfSize = max(sdfLocalMaxBounds - sdfLocalMinBounds, SIMD3<Float>(repeating: 1.0e-4))
+        let sdfVoxelSize = SIMD3<Float>(
+            sdfSize.x / Float(max(sdfResolution.x, 1)),
+            sdfSize.y / Float(max(sdfResolution.y, 1)),
+            sdfSize.z / Float(max(sdfResolution.z, 1))
+        )
+
+        let infoPtr = collisionMeshInfoBuffer.contents().bindMemory(
+            to: AVBDGPUCollisionMeshInfo.self,
+            capacity: max(collisionMeshCapacity, 1)
+        )
+        infoPtr[collisionMeshCount] = AVBDGPUCollisionMeshInfo(
+            vertexOffset: Int32(geometryResource.vertexOffset),
+            vertexCount: Int32(geometryResource.vertexCount),
+            indexOffset: Int32(geometryResource.indexOffset),
+            indexCount: Int32(geometryResource.indexCount),
+            ownerBodyIndex: Int32(mesh.ownerBodyIndex),
+            sdfResourceIndex: Int32(sdfResourceIndex),
+            _reserved0: SIMD2<Int32>(repeating: 0),
+            minBounds: SIMD4<Float>(worldBounds.min, 0),
+            maxBounds: SIMD4<Float>(worldBounds.max, 0),
+            sdfLocalMinBounds: SIMD4<Float>(sdfLocalMinBounds, 0),
+            sdfLocalMaxBounds: SIMD4<Float>(sdfLocalMaxBounds, 0),
+            sdfVoxelSize: SIMD4<Float>(sdfVoxelSize, 0),
+            sdfResolution: SIMD4<Int32>(sdfResolution.x, sdfResolution.y, sdfResolution.z, 0),
+            sdfTransform: mesh.transform,
+            sdfInvTransform: simd_inverse(mesh.transform)
+        )
+
+        collisionMeshCount += 1
+        forceFullBroadphase = true
+        collisionMeshSDFStatusText = "Cached"
+        return true
+    }
+
     init?(device: MTLDevice, scene: AVBDScene) {
         self.device = device
+        self.collisionMeshSDFCommandQueue = device.makeCommandQueue()
 
         guard let library = device.makeDefaultLibrary() else { return nil }
 
-        func makePSO(_ name: String) -> MTLComputePipelineState? {
-            guard let fn = library.makeFunction(name: name) else {
+        func makeFunction(_ name: String) -> MTLFunction? {
+            guard let function = library.makeFunction(name: name) else {
                 print("Missing compute function: \(name)")
                 return nil
             }
-            return try? device.makeComputePipelineState(function: fn)
+            return function
+        }
+
+        func makePSO(_ name: String) -> MTLComputePipelineState? {
+            guard let function = makeFunction(name) else {
+                return nil
+            }
+            return try? device.makeComputePipelineState(function: function)
+        }
+
+        guard let primitiveMeshSDFFunction = makeFunction("avbd_collide_primitive_mesh_sdf") else { return nil }
+        self.collisionMeshSDFArgumentEncoder = primitiveMeshSDFFunction.makeArgumentEncoder(bufferIndex: 12)
+        self.collisionMeshSDFArgumentBuffer = collisionMeshSDFArgumentEncoder.flatMap {
+            device.makeBuffer(length: $0.encodedLength, options: .storageModeShared)
         }
 
         guard let fwd = makePSO("avbd_forward_integrate"),
@@ -214,6 +604,16 @@ final class AVBDGPUSolver {
               let pbi = makePSO("avbd_prepare_broadphase_indirect"),
               let bpm = makePSO("avbd_build_primitive_manifolds"),
               let pai = makePSO("avbd_prepare_active_manifolds_indirect"),
+              let pmb = makePSO("avbd_broadphase_primitive_mesh"),
+              let pmci = makePSO("avbd_prepare_primitive_mesh_collision_indirect"),
+              let pcm = makePSO("avbd_collide_primitive_mesh"),
+              let pmsdf = try? device.makeComputePipelineState(function: primitiveMeshSDFFunction),
+              let smi = makePSO("avbd_initialize_mesh_sdf"),
+              let sma = makePSO("avbd_accumulate_mesh_sdf"),
+              let smf = makePSO("avbd_finalize_mesh_sdf"),
+              let mmb = makePSO("avbd_broadphase_mesh_mesh"),
+              let mmci = makePSO("avbd_prepare_mesh_mesh_collision_indirect"),
+              let mcm = makePSO("avbd_collide_mesh_mesh"),
               let bac = makePSO("avbd_build_adjacency_constraints"),
               let bam = makePSO("avbd_build_adjacency_manifolds"),
               let ij  = makePSO("avbd_init_joints"),
@@ -232,6 +632,16 @@ final class AVBDGPUSolver {
         prepareBroadphaseIndirectPSO = pbi
         buildPrimitiveManifoldsPSO = bpm
         prepareActiveManifoldsIndirectPSO = pai
+        primitiveMeshBroadphasePSO = pmb
+        preparePrimitiveMeshCollisionIndirectPSO = pmci
+        collidePrimitiveMeshPSO = pcm
+        collidePrimitiveMeshSDFPSO = pmsdf
+        initializeCollisionMeshSDFPSO = smi
+        accumulateCollisionMeshSDFPSO = sma
+        finalizeCollisionMeshSDFPSO = smf
+        meshMeshBroadphasePSO = mmb
+        prepareMeshMeshCollisionIndirectPSO = mmci
+        collideMeshMeshPSO = mcm
         buildAdjacencyConstraintsPSO = bac
         buildAdjacencyManifoldsPSO = bam
         initJointsPSO = ij
@@ -321,8 +731,14 @@ final class AVBDGPUSolver {
         numColors = 1
         // Cap manifold/contact buffers to max collisions per body instead of n*(n-1)/2
         let maxCollisionsPerBody = Int(AVBD_MAX_COLLISIONS_PER_BODY)
-        maxCollisions = max(bodyCapacity * maxCollisionsPerBody, 1)
+        bodyBodyManifoldCapacity = max(bodyCapacity * maxCollisionsPerBody, 1)
+        primitiveMeshManifoldCapacity = 1
+        maxCollisions = bodyBodyManifoldCapacity + primitiveMeshManifoldCapacity
         recentPairCapacity = max(bodyCapacity * (bodyCapacity - 1) / 2, 1)
+        collisionMeshCapacity = 1024
+        collisionMeshCount = 0
+        primitiveMeshPairCapacity = max(bodyCapacity * collisionMeshCapacity, 1)
+        meshMeshPairCapacity = max(collisionMeshCapacity * max(collisionMeshCapacity - 1, 0) / 2, 1)
 
         let bodyBufSize = max(MemoryLayout<AVBDGPUBody>.stride * bodyCapacity, 16)
         let bodyColorBufSize = max(MemoryLayout<Int32>.stride * bodyCapacity, 16)
@@ -338,12 +754,21 @@ final class AVBDGPUSolver {
         let recentPairIndexBufSize = max(MemoryLayout<Int32>.stride * recentPairCapacity, 16)
         let recentPairStateBufSize = max(MemoryLayout<AVBDGPURecentPairCacheState>.stride, 16)
         let recentPairIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
-        let derivedPairCandidateBufSize = max(MemoryLayout<Int32>.stride * maxCollisions, 16)
+        let derivedPairCandidateBufSize = max(MemoryLayout<Int32>.stride * bodyBodyManifoldCapacity, 16)
         let derivedPairStateBufSize = max(MemoryLayout<AVBDGPUDerivedPairCandidateState>.stride, 16)
         let derivedPairIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
         let activeManifoldIndexBufSize = max(MemoryLayout<Int32>.stride * maxCollisions, 16)
         let activeManifoldStateBufSize = max(MemoryLayout<AVBDGPUActiveManifoldListState>.stride, 16)
         let activeManifoldIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
+        let collisionMeshInfoBufSize = max(MemoryLayout<AVBDGPUCollisionMeshInfo>.stride * collisionMeshCapacity, 16)
+        let collisionMeshVertexBufSize = max(MemoryLayout<SIMD3<Float>>.stride, 16)
+        let collisionMeshIndexBufSize = max(MemoryLayout<UInt32>.stride, 16)
+        let primitiveMeshPairBufSize = max(MemoryLayout<AVBDGPUPrimitiveMeshPair>.stride * primitiveMeshPairCapacity, 16)
+        let primitiveMeshPairStateBufSize = max(MemoryLayout<AVBDGPUPrimitiveMeshPairListState>.stride, 16)
+        let primitiveMeshPairIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
+        let meshMeshPairBufSize = max(MemoryLayout<AVBDGPUMeshMeshPair>.stride * meshMeshPairCapacity, 16)
+        let meshMeshPairStateBufSize = max(MemoryLayout<AVBDGPUMeshMeshPairListState>.stride, 16)
+        let meshMeshPairIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
 
         guard let bb = device.makeBuffer(length: bodyBufSize, options: .storageModeShared),
               let bcb = device.makeBuffer(length: bodyColorBufSize, options: .storageModeShared),
@@ -372,6 +797,15 @@ final class AVBDGPUSolver {
               let pctb = device.makeBuffer(length: contactBufSize, options: .storageModeShared),
               let pami = device.makeBuffer(length: activeManifoldIndexBufSize, options: .storageModeShared),
               let pams = device.makeBuffer(length: activeManifoldStateBufSize, options: .storageModeShared),
+              let cmi = device.makeBuffer(length: collisionMeshInfoBufSize, options: .storageModeShared),
+              let cmv = device.makeBuffer(length: collisionMeshVertexBufSize, options: .storageModeShared),
+              let cmii = device.makeBuffer(length: collisionMeshIndexBufSize, options: .storageModeShared),
+              let pmp = device.makeBuffer(length: primitiveMeshPairBufSize, options: .storageModeShared),
+              let pmps = device.makeBuffer(length: primitiveMeshPairStateBufSize, options: .storageModeShared),
+              let pmpi = device.makeBuffer(length: primitiveMeshPairIndirectBufSize, options: .storageModeShared),
+              let mmp = device.makeBuffer(length: meshMeshPairBufSize, options: .storageModeShared),
+              let mmps = device.makeBuffer(length: meshMeshPairStateBufSize, options: .storageModeShared),
+              let mmpi = device.makeBuffer(length: meshMeshPairIndirectBufSize, options: .storageModeShared),
               let pb = device.makeBuffer(length: MemoryLayout<AVBDGPUSolverParams>.stride, options: .storageModeShared)
         else { return nil }
 
@@ -399,6 +833,15 @@ final class AVBDGPUSolver {
         prevContactBuffer = pctb
         prevActiveManifoldIndexBuffer = pami
         prevActiveManifoldStateBuffer = pams
+        collisionMeshInfoBuffer = cmi
+        collisionMeshVertexBuffer = cmv
+        collisionMeshIndexBuffer = cmii
+        primitiveMeshPairBuffer = pmp
+        primitiveMeshPairStateBuffer = pmps
+        primitiveMeshPairIndirectBuffer = pmpi
+        meshMeshPairBuffer = mmp
+        meshMeshPairStateBuffer = mmps
+        meshMeshPairIndirectBuffer = mmpi
         paramsBuffer = pb
         contactCapacity = maxCollisions * SWIFT_AVBD_MAX_CONTACTS_PER_PAIR
         recentPairCacheSlot = 0
@@ -419,7 +862,7 @@ final class AVBDGPUSolver {
         }
 
         let derivedPairStatePtr = derivedPairStateBuffer.contents().bindMemory(to: AVBDGPUDerivedPairCandidateState.self, capacity: 1)
-        derivedPairStatePtr.pointee = AVBDGPUDerivedPairCandidateState(count: Int32(0), capacity: Int32(maxCollisions))
+        derivedPairStatePtr.pointee = AVBDGPUDerivedPairCandidateState(count: Int32(0), capacity: Int32(bodyBodyManifoldCapacity))
 
         let derivedPairIndirectPtr = derivedPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
         derivedPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
@@ -432,6 +875,21 @@ final class AVBDGPUSolver {
 
         let activeManifoldIndirectPtr = activeManifoldIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
         activeManifoldIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+
+        let primitiveMeshPairStatePtr = primitiveMeshPairStateBuffer.contents().bindMemory(to: AVBDGPUPrimitiveMeshPairListState.self, capacity: 1)
+        primitiveMeshPairStatePtr.pointee = AVBDGPUPrimitiveMeshPairListState(count: Int32(0), capacity: Int32(primitiveMeshPairCapacity))
+
+        let primitiveMeshPairIndirectPtr = primitiveMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
+        primitiveMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+
+        let meshMeshPairStatePtr = meshMeshPairStateBuffer.contents().bindMemory(to: AVBDGPUMeshMeshPairListState.self, capacity: 1)
+        meshMeshPairStatePtr.pointee = AVBDGPUMeshMeshPairListState(
+            count: Int32(0),
+            capacity: Int32(meshMeshPairCapacity)
+        )
+
+        let meshMeshPairIndirectPtr = meshMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
+        meshMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
 
         uploadBodies()
         uploadRenderColors(scene.bodies.map(\.renderColor))
@@ -502,6 +960,38 @@ final class AVBDGPUSolver {
 
         forceFullBroadphase = true
         return newIndex
+    }
+
+    func addIgnoredCollisionPair(bodyA: Int, bodyB: Int) {
+        addIgnoredCollisionPairs([(bodyA, bodyB)])
+    }
+
+    func isDynamicBody(_ bodyIndex: Int) -> Bool {
+        guard bodyIndex >= 0, bodyIndex < bodyCount else {
+            return false
+        }
+        return cpuBodies[bodyIndex].mass > 0
+    }
+
+    func addIgnoredCollisionPairs<S: Sequence>(_ pairs: S) where S.Element == (Int, Int) {
+        var insertedAny = false
+        for (bodyA, bodyB) in pairs {
+            guard bodyA >= 0, bodyB >= 0, bodyA < bodyCount, bodyB < bodyCount, bodyA != bodyB else {
+                continue
+            }
+            let lower = min(bodyA, bodyB)
+            let upper = max(bodyA, bodyB)
+            let key = (UInt64(upper) << 32) | UInt64(lower)
+            if ignorePairs.insert(key).inserted {
+                insertedAny = true
+            }
+        }
+
+        guard insertedAny else {
+            return
+        }
+        computeAndUploadExclusions()
+        forceFullBroadphase = true
     }
 
     func writeRenderInstances(
@@ -589,6 +1079,15 @@ final class AVBDGPUSolver {
     func step(commandBuffer: MTLCommandBuffer, instanceBuffer: MTLBuffer, instanceOffset: Int) {
         uploadParams()
 
+        let primitiveMeshPairStatePtr = primitiveMeshPairStateBuffer.contents().bindMemory(to: AVBDGPUPrimitiveMeshPairListState.self, capacity: 1)
+        primitiveMeshPairStatePtr.pointee = AVBDGPUPrimitiveMeshPairListState(
+            count: Int32(0),
+            capacity: Int32(primitiveMeshPairCapacity)
+        )
+
+        let primitiveMeshPairIndirectPtr = primitiveMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
+        primitiveMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+
         // Blit previous frame's manifold/contact data for warmstarting
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.copy(from: manifoldBuffer, sourceOffset: 0, to: prevManifoldBuffer, destinationOffset: 0, size: manifoldBuffer.length)
@@ -613,6 +1112,18 @@ final class AVBDGPUSolver {
         let adjacencyConstraintThreads = MTLSize(width: max(cpuJoints.count, cpuSprings.count, 1), height: 1, depth: 1)
         let threadgroupSize = MTLSize(width: broadphaseWidth, height: 1, depth: 1)
         let derivedThreadgroupSize = MTLSize(width: buildPrimitiveManifoldsPSO.threadExecutionWidth, height: 1, depth: 1)
+        let primitiveMeshBroadphasePairCount = max(bodyCount * collisionMeshCount, 1)
+        let primitiveMeshBroadphaseWidth = primitiveMeshBroadphasePSO.threadExecutionWidth
+        let primitiveMeshBroadphaseThreads = MTLSize(width: primitiveMeshBroadphasePairCount, height: 1, depth: 1)
+        let primitiveMeshCollisionThreadgroupSize = MTLSize(
+            width: max(collidePrimitiveMeshPSO.threadExecutionWidth, collidePrimitiveMeshSDFPSO.threadExecutionWidth),
+            height: 1,
+            depth: 1
+        )
+        let meshMeshBroadphasePairCount = max(collisionMeshCount * collisionMeshCount, 1)
+        let meshMeshBroadphaseWidth = meshMeshBroadphasePSO.threadExecutionWidth
+        let meshMeshBroadphaseThreads = MTLSize(width: meshMeshBroadphasePairCount, height: 1, depth: 1)
+        let meshMeshCollisionThreadgroupSize = MTLSize(width: collideMeshMeshPSO.threadExecutionWidth, height: 1, depth: 1)
         let currentRecentPairCount = Int(currentRecentPairStateBuffer.contents().bindMemory(to: AVBDGPURecentPairCacheState.self, capacity: 1).pointee.count)
         let shouldRunFullBroadphase = broadphaseFullRefreshStepCount <= 0
             || forceFullBroadphase
@@ -683,6 +1194,93 @@ final class AVBDGPUSolver {
             threadsPerThreadgroup: derivedThreadgroupSize
         )
 
+        if collisionMeshCount > 0 && bodyCount > 0 {
+            encoder.setComputePipelineState(primitiveMeshBroadphasePSO)
+            encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
+            encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 1)
+            encoder.setBuffer(primitiveMeshPairBuffer, offset: 0, index: 2)
+            encoder.setBuffer(primitiveMeshPairStateBuffer, offset: 0, index: 3)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 4)
+            encoder.dispatchThreads(
+                primitiveMeshBroadphaseThreads,
+                threadsPerThreadgroup: MTLSize(width: primitiveMeshBroadphaseWidth, height: 1, depth: 1)
+            )
+
+            encoder.setComputePipelineState(preparePrimitiveMeshCollisionIndirectPSO)
+            encoder.setBuffer(primitiveMeshPairStateBuffer, offset: 0, index: 0)
+            encoder.setBuffer(primitiveMeshPairIndirectBuffer, offset: 0, index: 1)
+            encoder.dispatchThreads(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            )
+
+            let usePrimitiveMeshSDF = collisionMeshSDFArgumentBuffer != nil
+                && !collisionMeshSDFTextures.isEmpty
+            encoder.setComputePipelineState(
+                usePrimitiveMeshSDF
+                    ? collidePrimitiveMeshSDFPSO
+                    : collidePrimitiveMeshPSO
+            )
+            encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
+            encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 1)
+            encoder.setBuffer(primitiveMeshPairBuffer, offset: 0, index: 2)
+            encoder.setBuffer(primitiveMeshPairStateBuffer, offset: 0, index: 3)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 4)
+            encoder.setBuffer(collisionMeshVertexBuffer, offset: 0, index: 5)
+            encoder.setBuffer(collisionMeshIndexBuffer, offset: 0, index: 6)
+            encoder.setBuffer(manifoldBuffer, offset: 0, index: 7)
+            encoder.setBuffer(contactBuffer, offset: 0, index: 8)
+            encoder.setBuffer(contactAllocatorBuffer, offset: 0, index: 9)
+            encoder.setBuffer(activeManifoldIndexBuffer, offset: 0, index: 10)
+            encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 11)
+            if usePrimitiveMeshSDF,
+               let collisionMeshSDFArgumentBuffer {
+                encoder.setBuffer(collisionMeshSDFArgumentBuffer, offset: 0, index: 12)
+                for texture in collisionMeshSDFTextures {
+                    encoder.useResource(texture, usage: .read)
+                }
+            }
+            encoder.dispatchThreadgroups(
+                indirectBuffer: primitiveMeshPairIndirectBuffer,
+                indirectBufferOffset: 0,
+                threadsPerThreadgroup: primitiveMeshCollisionThreadgroupSize
+            )
+        }
+
+        if collisionMeshCount > 1 {
+            encoder.setComputePipelineState(meshMeshBroadphasePSO)
+            encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 0)
+            encoder.setBuffer(meshMeshPairBuffer, offset: 0, index: 1)
+            encoder.setBuffer(meshMeshPairStateBuffer, offset: 0, index: 2)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 3)
+            encoder.dispatchThreads(
+                meshMeshBroadphaseThreads,
+                threadsPerThreadgroup: MTLSize(width: meshMeshBroadphaseWidth, height: 1, depth: 1)
+            )
+
+            encoder.setComputePipelineState(prepareMeshMeshCollisionIndirectPSO)
+            encoder.setBuffer(meshMeshPairStateBuffer, offset: 0, index: 0)
+            encoder.setBuffer(meshMeshPairIndirectBuffer, offset: 0, index: 1)
+            encoder.dispatchThreads(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            )
+
+            encoder.setComputePipelineState(collideMeshMeshPSO)
+            encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 0)
+            encoder.setBuffer(meshMeshPairBuffer, offset: 0, index: 1)
+            encoder.setBuffer(meshMeshPairStateBuffer, offset: 0, index: 2)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 3)
+            encoder.dispatchThreadgroups(
+                indirectBuffer: meshMeshPairIndirectBuffer,
+                indirectBufferOffset: 0,
+                threadsPerThreadgroup: meshMeshCollisionThreadgroupSize
+            )
+        }
+
+        // Prepare active manifold indirect dispatch args AFTER all manifold
+        // generation (body-body, primitive-mesh, mesh-mesh) is complete so that
+        // the count reflects every active manifold.
         encoder.setComputePipelineState(prepareActiveManifoldsIndirectPSO)
         encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 0)
         encoder.setBuffer(activeManifoldIndirectBuffer, offset: 0, index: 1)
@@ -1077,6 +1675,8 @@ final class AVBDGPUSolver {
             bodyCount: Int32(bodyCount),
             jointCount: Int32(cpuJoints.count),
             springCount: Int32(cpuSprings.count),
+            meshCount: Int32(collisionMeshCount),
+            primitiveMeshManifoldOffset: Int32(bodyBodyManifoldCapacity),
             collisionMargin: gpuCollisionMargin,
             cacheMargin: effectiveCacheMargin,
             cacheTimeHorizon: cacheTimeHorizon,
@@ -1084,12 +1684,472 @@ final class AVBDGPUSolver {
             penaltyMax: gpuPenaltyMax,
             stickThreshold: gpuStickThreshold,
             torusApproxSphereCount: Int32(avbdCurrentTorusApproxSphereCount()),
-            torusApproxSphereRadiusScale: AVBDTorusApproximationSettings.radiusScale
+            torusApproxSphereRadiusScale: AVBDTorusApproximationSettings.radiusScale,
+            linearDamping: linearDamping,
+            angularDamping: angularDamping
         )
+    }
+
+    func setCollisionMeshes(_ meshes: [AVBDCollisionMeshBroadphaseMesh]) {
+        let clampedMeshes = Array(meshes.prefix(min(collisionMeshCapacity, gpuMaxCollisionMeshSDFs)))
+        collisionMeshCount = clampedMeshes.count
+        ensureCollisionCapacity(forMeshCount: collisionMeshCount)
+        collisionMeshSDFTextures.removeAll(keepingCapacity: true)
+        collisionMeshSDFStatusText = collisionMeshCount > 0 ? "Building..." : "Idle"
+
+        var meshInfos = Array(repeating: AVBDGPUCollisionMeshInfo(), count: max(collisionMeshCapacity, 1))
+        var meshVertices: [SIMD3<Float>] = []
+        var meshIndices: [UInt32] = []
+        var collisionMeshSDFTextures: [MTLTexture] = []
+        var sdfResourceIndexByKey: [String: Int] = [:]
+        var geometryResourceByKey: [String: CollisionMeshGeometryResource] = [:]
+        var cacheHitCount = 0
+        var uniqueSDFBuildCount = 0
+        let buildStartTime = CACurrentMediaTime()
+
+        meshVertices.reserveCapacity(clampedMeshes.reduce(0) { $0 + $1.positions.count })
+        meshIndices.reserveCapacity(clampedMeshes.reduce(0) { $0 + $1.indices.count })
+        collisionMeshSDFTextures.reserveCapacity(collisionMeshCount)
+
+        for meshIndex in 0..<collisionMeshCount {
+            let mesh = clampedMeshes[meshIndex]
+            let sdfPadding = Self.collisionMeshSDFPadding(for: mesh)
+            let sdfLocalMinBounds = mesh.localBoundsMin - sdfPadding
+            let sdfLocalMaxBounds = mesh.localBoundsMax + sdfPadding
+            let sdfResolution = Self.collisionMeshSDFResolution(
+                localMinBounds: sdfLocalMinBounds,
+                localMaxBounds: sdfLocalMaxBounds
+            )
+
+            let worldBounds = Self.transformedBounds(
+                localMinBounds: sdfLocalMinBounds,
+                localMaxBounds: sdfLocalMaxBounds,
+                transform: mesh.transform
+            )
+            let sdfSize = max(sdfLocalMaxBounds - sdfLocalMinBounds, SIMD3<Float>(repeating: 1.0e-4))
+            let sdfVoxelSize = SIMD3<Float>(
+                sdfSize.x / Float(max(sdfResolution.x, 1)),
+                sdfSize.y / Float(max(sdfResolution.y, 1)),
+                sdfSize.z / Float(max(sdfResolution.z, 1))
+            )
+            let sdfCacheKey = Self.collisionMeshSDFCacheKey(
+                mesh: mesh,
+                localBoundsMin: sdfLocalMinBounds,
+                localBoundsMax: sdfLocalMaxBounds,
+                resolution: sdfResolution
+            )
+            let geometryResource: CollisionMeshGeometryResource
+            if let existingGeometryResource = geometryResourceByKey[sdfCacheKey] {
+                geometryResource = existingGeometryResource
+            } else {
+                let vertexOffset = meshVertices.count
+                let indexOffset = meshIndices.count
+                meshVertices.append(contentsOf: mesh.positions)
+                meshIndices.append(contentsOf: mesh.indices.map { UInt32(vertexOffset) + $0 })
+                geometryResource = CollisionMeshGeometryResource(
+                    vertexOffset: vertexOffset,
+                    vertexCount: mesh.positions.count,
+                    indexOffset: indexOffset,
+                    indexCount: mesh.indices.count
+                )
+                geometryResourceByKey[sdfCacheKey] = geometryResource
+            }
+            let sdfResourceIndex: Int
+            if let existingResourceIndex = sdfResourceIndexByKey[sdfCacheKey] {
+                sdfResourceIndex = existingResourceIndex
+            } else {
+                let sdfTexture: MTLTexture?
+                if let cached = Self.cachedCollisionMeshSDF(for: sdfCacheKey) {
+                    sdfTexture = cached.texture
+                    cacheHitCount += 1
+                } else {
+                    sdfTexture = buildCollisionMeshSDFTexture(
+                        localVertices: mesh.positions,
+                        indices: mesh.indices,
+                        localBoundsMin: sdfLocalMinBounds,
+                        localBoundsMax: sdfLocalMaxBounds,
+                        resolution: sdfResolution
+                    )
+                    if let sdfTexture {
+                        Self.storeCollisionMeshSDF(sdfTexture, for: sdfCacheKey)
+                    }
+                }
+
+                guard let sdfTexture else {
+                    print("Failed to build collision mesh SDF texture for mesh \(meshIndex)")
+                    collisionMeshSDFTextures.removeAll(keepingCapacity: true)
+                    break
+                }
+
+                sdfResourceIndex = collisionMeshSDFTextures.count
+                sdfResourceIndexByKey[sdfCacheKey] = sdfResourceIndex
+                collisionMeshSDFTextures.append(sdfTexture)
+                uniqueSDFBuildCount += 1
+            }
+
+            meshInfos[meshIndex] = AVBDGPUCollisionMeshInfo(
+                vertexOffset: Int32(geometryResource.vertexOffset),
+                vertexCount: Int32(geometryResource.vertexCount),
+                indexOffset: Int32(geometryResource.indexOffset),
+                indexCount: Int32(geometryResource.indexCount),
+                ownerBodyIndex: Int32(mesh.ownerBodyIndex),
+                sdfResourceIndex: Int32(sdfResourceIndex),
+                _reserved0: SIMD2<Int32>(repeating: 0),
+                minBounds: SIMD4<Float>(worldBounds.min, 0),
+                maxBounds: SIMD4<Float>(worldBounds.max, 0),
+                sdfLocalMinBounds: SIMD4<Float>(sdfLocalMinBounds, 0),
+                sdfLocalMaxBounds: SIMD4<Float>(sdfLocalMaxBounds, 0),
+                sdfVoxelSize: SIMD4<Float>(sdfVoxelSize, 0),
+                sdfResolution: SIMD4<Int32>(sdfResolution.x, sdfResolution.y, sdfResolution.z, 0),
+                sdfTransform: mesh.transform,
+                sdfInvTransform: simd_inverse(mesh.transform)
+            )
+        }
+
+        collisionMeshGeometryResources = geometryResourceByKey
+        collisionMeshSDFResourceIndicesByKey = sdfResourceIndexByKey
+        collisionMeshVertexCountUsed = meshVertices.count
+        collisionMeshIndexCountUsed = meshIndices.count
+
+        if collisionMeshInfoBuffer.length < MemoryLayout<AVBDGPUCollisionMeshInfo>.stride * max(collisionMeshCapacity, 1) {
+            collisionMeshInfoBuffer = device.makeBuffer(
+                length: MemoryLayout<AVBDGPUCollisionMeshInfo>.stride * max(collisionMeshCapacity, 1),
+                options: .storageModeShared
+            )!
+        }
+        if collisionMeshVertexBuffer.length < MemoryLayout<SIMD3<Float>>.stride * max(meshVertices.count, 1) {
+            collisionMeshVertexBuffer = device.makeBuffer(
+                length: MemoryLayout<SIMD3<Float>>.stride * max(meshVertices.count, 1),
+                options: .storageModeShared
+            )!
+        }
+        if collisionMeshIndexBuffer.length < MemoryLayout<UInt32>.stride * max(meshIndices.count, 1) {
+            collisionMeshIndexBuffer = device.makeBuffer(
+                length: MemoryLayout<UInt32>.stride * max(meshIndices.count, 1),
+                options: .storageModeShared
+            )!
+        }
+
+        let infoPtr = collisionMeshInfoBuffer.contents().bindMemory(to: AVBDGPUCollisionMeshInfo.self, capacity: max(collisionMeshCapacity, 1))
+        for meshIndex in 0..<max(collisionMeshCapacity, 1) {
+            infoPtr[meshIndex] = meshInfos[meshIndex]
+        }
+
+        if !meshVertices.isEmpty {
+            let vertexPtr = collisionMeshVertexBuffer.contents().bindMemory(to: SIMD3<Float>.self, capacity: meshVertices.count)
+            for vertexIndex in meshVertices.indices {
+                vertexPtr[vertexIndex] = meshVertices[vertexIndex]
+            }
+        }
+
+        if !meshIndices.isEmpty {
+            let indexPtr = collisionMeshIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: meshIndices.count)
+            for index in meshIndices.indices {
+                indexPtr[index] = meshIndices[index]
+            }
+        }
+
+        self.collisionMeshSDFTextures = collisionMeshSDFTextures
+        updateCollisionMeshSDFArgumentBufferBindings()
+
+        let buildDurationMS = (CACurrentMediaTime() - buildStartTime) * 1000.0
+        if collisionMeshCount == 0 {
+            collisionMeshSDFStatusText = "Idle"
+        } else if !collisionMeshSDFTextures.isEmpty {
+            if uniqueSDFBuildCount == cacheHitCount && uniqueSDFBuildCount > 0 {
+                collisionMeshSDFStatusText = String(format: "Cached %.1f ms", buildDurationMS)
+            } else if cacheHitCount > 0 {
+                collisionMeshSDFStatusText = String(format: "Built %d/%d %.1f ms", uniqueSDFBuildCount - cacheHitCount, uniqueSDFBuildCount, buildDurationMS)
+            } else {
+                collisionMeshSDFStatusText = String(format: "Built %d %.1f ms", uniqueSDFBuildCount, buildDurationMS)
+            }
+        } else {
+            collisionMeshSDFStatusText = "Build Failed"
+        }
+
+        forceFullBroadphase = true
+    }
+
+    private func buildCollisionMeshSDFTexture(
+        localVertices: [SIMD3<Float>],
+        indices: [UInt32],
+        localBoundsMin: SIMD3<Float>,
+        localBoundsMax: SIMD3<Float>,
+        resolution: SIMD3<Int32>
+    ) -> MTLTexture? {
+        guard let collisionMeshSDFCommandQueue,
+              !localVertices.isEmpty,
+              indices.count >= 3,
+              indices.count % 3 == 0 else {
+            return nil
+        }
+
+        let voxelCount = Int(resolution.x * resolution.y * resolution.z)
+        guard voxelCount > 0,
+              let vertexBuffer = device.makeBuffer(
+                bytes: localVertices,
+                length: MemoryLayout<SIMD3<Float>>.stride * localVertices.count,
+                options: .storageModeShared
+              ),
+              let indexBuffer = device.makeBuffer(
+                bytes: indices,
+                length: MemoryLayout<UInt32>.stride * indices.count,
+                options: .storageModeShared
+              ),
+              let insideCountBuffer = device.makeBuffer(
+                length: MemoryLayout<UInt32>.stride * voxelCount,
+                options: .storageModeShared
+              ) else {
+            return nil
+        }
+
+        memset(insideCountBuffer.contents(), 0, insideCountBuffer.length)
+
+        let textureDescriptor = MTLTextureDescriptor()
+        textureDescriptor.textureType = .type3D
+        textureDescriptor.pixelFormat = .r32Float
+        textureDescriptor.width = Int(resolution.x)
+        textureDescriptor.height = Int(resolution.y)
+        textureDescriptor.depth = Int(resolution.z)
+        textureDescriptor.storageMode = .private
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+
+        guard let texture = device.makeTexture(descriptor: textureDescriptor),
+              let commandBuffer = collisionMeshSDFCommandQueue.makeCommandBuffer() else {
+            return nil
+        }
+
+        let voxelSize = (localBoundsMax - localBoundsMin) / SIMD3<Float>(
+            Float(max(resolution.x, 1)),
+            Float(max(resolution.y, 1)),
+            Float(max(resolution.z, 1))
+        )
+        let threadsPerThreadgroup = MTLSize(width: 4, height: 4, depth: 4)
+        let threadsPerGrid = MTLSize(
+            width: Int(resolution.x),
+            height: Int(resolution.y),
+            depth: Int(resolution.z)
+        )
+
+        if let initializeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            initializeEncoder.setComputePipelineState(initializeCollisionMeshSDFPSO)
+            initializeEncoder.setTexture(texture, index: 0)
+            initializeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            initializeEncoder.endEncoding()
+        } else {
+            return nil
+        }
+
+        let triangleCount = indices.count / 3
+        var triangleOffset = 0
+        while triangleOffset < triangleCount {
+            let triangleChunkCount = min(gpuCollisionMeshSDFTriangleChunkSize, triangleCount - triangleOffset)
+            guard let accumulateEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                return nil
+            }
+
+            var triangleOffsetValue = UInt32(triangleOffset)
+            var triangleChunkCountValue = UInt32(triangleChunkCount)
+            var sdfOrigin = localBoundsMin
+            var voxelSizeValue = voxelSize
+
+            accumulateEncoder.setComputePipelineState(accumulateCollisionMeshSDFPSO)
+            accumulateEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
+            accumulateEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
+            accumulateEncoder.setTexture(texture, index: 0)
+            accumulateEncoder.setBuffer(insideCountBuffer, offset: 0, index: 2)
+            accumulateEncoder.setBytes(&triangleOffsetValue, length: MemoryLayout<UInt32>.stride, index: 3)
+            accumulateEncoder.setBytes(&triangleChunkCountValue, length: MemoryLayout<UInt32>.stride, index: 4)
+            accumulateEncoder.setBytes(&sdfOrigin, length: MemoryLayout<SIMD3<Float>>.stride, index: 5)
+            accumulateEncoder.setBytes(&voxelSizeValue, length: MemoryLayout<SIMD3<Float>>.stride, index: 6)
+            accumulateEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            accumulateEncoder.endEncoding()
+
+            triangleOffset += triangleChunkCount
+        }
+
+        if let finalizeEncoder = commandBuffer.makeComputeCommandEncoder() {
+            finalizeEncoder.setComputePipelineState(finalizeCollisionMeshSDFPSO)
+            finalizeEncoder.setTexture(texture, index: 0)
+            finalizeEncoder.setBuffer(insideCountBuffer, offset: 0, index: 0)
+            finalizeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+            finalizeEncoder.endEncoding()
+        } else {
+            return nil
+        }
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if commandBuffer.status == .error {
+            print("Failed to build collision mesh SDF texture: \(commandBuffer.error?.localizedDescription ?? "unknown error")")
+            return nil
+        }
+
+        return texture
+    }
+
+    private static func collisionMeshSDFPadding(for mesh: AVBDCollisionMeshBroadphaseMesh) -> SIMD3<Float> {
+        let extent = max(mesh.localBoundsMax - mesh.localBoundsMin, SIMD3<Float>(repeating: 1.0e-3))
+        return max(extent * 0.05, SIMD3<Float>(repeating: gpuCollisionMargin * 4.0))
+    }
+
+    private static func collisionMeshSDFResolution(
+        localMinBounds: SIMD3<Float>,
+        localMaxBounds: SIMD3<Float>
+    ) -> SIMD3<Int32> {
+        let extent = max(localMaxBounds - localMinBounds, SIMD3<Float>(repeating: 1.0e-3))
+        let longestAxis = max(extent.x, max(extent.y, extent.z))
+        let voxelScale = Float(gpuCollisionMeshSDFLongestAxisResolution) / max(longestAxis, 1.0e-3)
+        let minResolution = SIMD3<Int32>(repeating: 16)
+        let maxResolution = SIMD3<Int32>(repeating: gpuCollisionMeshSDFLongestAxisResolution)
+        let scaled = SIMD3<Int32>(
+            Int32(clamping: Int(ceil(extent.x * voxelScale))),
+            Int32(clamping: Int(ceil(extent.y * voxelScale))),
+            Int32(clamping: Int(ceil(extent.z * voxelScale)))
+        )
+        return simd_clamp(max(scaled, minResolution), minResolution, maxResolution)
+    }
+
+    private static func transformedBounds(
+        localMinBounds: SIMD3<Float>,
+        localMaxBounds: SIMD3<Float>,
+        transform: simd_float4x4
+    ) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
+        var minBounds = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var maxBounds = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+
+        for x in [localMinBounds.x, localMaxBounds.x] {
+            for y in [localMinBounds.y, localMaxBounds.y] {
+                for z in [localMinBounds.z, localMaxBounds.z] {
+                    let transformed = transform * SIMD4<Float>(x, y, z, 1)
+                    let point = SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+                    minBounds = simd_min(minBounds, point)
+                    maxBounds = simd_max(maxBounds, point)
+                }
+            }
+        }
+
+        return (minBounds, maxBounds)
+    }
+
+    private static func collisionMeshSDFCacheKey(
+        mesh: AVBDCollisionMeshBroadphaseMesh,
+        localBoundsMin: SIMD3<Float>,
+        localBoundsMax: SIMD3<Float>,
+        resolution: SIMD3<Int32>
+    ) -> String {
+        if !mesh.sdfResourceID.isEmpty {
+            return "\(mesh.sdfResourceID)#\(localBoundsMin.x.bitPattern):\(localBoundsMin.y.bitPattern):\(localBoundsMin.z.bitPattern):\(localBoundsMax.x.bitPattern):\(localBoundsMax.y.bitPattern):\(localBoundsMax.z.bitPattern):\(resolution.x):\(resolution.y):\(resolution.z)"
+        }
+
+        var hasher = Hasher()
+        hasher.combine(mesh.positions.count)
+        hasher.combine(mesh.indices.count)
+        hasher.combine(localBoundsMin.x.bitPattern)
+        hasher.combine(localBoundsMin.y.bitPattern)
+        hasher.combine(localBoundsMin.z.bitPattern)
+        hasher.combine(localBoundsMax.x.bitPattern)
+        hasher.combine(localBoundsMax.y.bitPattern)
+        hasher.combine(localBoundsMax.z.bitPattern)
+        hasher.combine(resolution.x)
+        hasher.combine(resolution.y)
+        hasher.combine(resolution.z)
+
+        for position in mesh.positions.prefix(64) {
+            hasher.combine(position.x.bitPattern)
+            hasher.combine(position.y.bitPattern)
+            hasher.combine(position.z.bitPattern)
+        }
+        for index in mesh.indices.prefix(256) {
+            hasher.combine(index)
+        }
+        return String(hasher.finalize())
     }
 
     func invalidateBroadphaseCache() {
         forceFullBroadphase = true
+    }
+
+    private func ensureCollisionCapacity(forMeshCount meshCount: Int) {
+        let requiredPrimitiveMeshManifoldCapacity = max(bodyCapacity * max(meshCount, 1), 1)
+        let requiredMaxCollisions = bodyBodyManifoldCapacity + requiredPrimitiveMeshManifoldCapacity
+        if requiredMaxCollisions <= maxCollisions {
+            primitiveMeshManifoldCapacity = requiredPrimitiveMeshManifoldCapacity
+            return
+        }
+
+        let manifoldBufSize = max(MemoryLayout<AVBDGPUManifold>.stride * requiredMaxCollisions, 16)
+        let contactBufSize = max(MemoryLayout<AVBDGPUContact>.stride * requiredMaxCollisions * SWIFT_AVBD_MAX_CONTACTS_PER_PAIR, 16)
+        let activeManifoldIndexBufSize = max(MemoryLayout<Int32>.stride * requiredMaxCollisions, 16)
+        let activeManifoldStateBufSize = max(MemoryLayout<AVBDGPUActiveManifoldListState>.stride, 16)
+        let activeManifoldIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
+
+        guard let mb = device.makeBuffer(length: manifoldBufSize, options: .storageModeShared),
+              let ctb = device.makeBuffer(length: contactBufSize, options: .storageModeShared),
+              let ami = device.makeBuffer(length: activeManifoldIndexBufSize, options: .storageModeShared),
+              let ams = device.makeBuffer(length: activeManifoldStateBufSize, options: .storageModeShared),
+              let amd = device.makeBuffer(length: activeManifoldIndirectBufSize, options: .storageModeShared),
+              let pmb = device.makeBuffer(length: manifoldBufSize, options: .storageModeShared),
+              let pctb = device.makeBuffer(length: contactBufSize, options: .storageModeShared),
+              let pami = device.makeBuffer(length: activeManifoldIndexBufSize, options: .storageModeShared),
+              let pams = device.makeBuffer(length: activeManifoldStateBufSize, options: .storageModeShared)
+        else {
+            return
+        }
+
+        manifoldBuffer = mb
+        contactBuffer = ctb
+        activeManifoldIndexBuffer = ami
+        activeManifoldStateBuffer = ams
+        activeManifoldIndirectBuffer = amd
+        prevManifoldBuffer = pmb
+        prevContactBuffer = pctb
+        prevActiveManifoldIndexBuffer = pami
+        prevActiveManifoldStateBuffer = pams
+        primitiveMeshManifoldCapacity = requiredPrimitiveMeshManifoldCapacity
+        maxCollisions = requiredMaxCollisions
+        contactCapacity = requiredMaxCollisions * SWIFT_AVBD_MAX_CONTACTS_PER_PAIR
+
+        let allocatorPtr = contactAllocatorBuffer.contents().bindMemory(to: AVBDGPUContactAllocator.self, capacity: 1)
+        allocatorPtr.pointee = AVBDGPUContactAllocator(nextContactIndex: Int32(0), contactCapacity: Int32(contactCapacity))
+
+        let activeManifoldStatePtr = activeManifoldStateBuffer.contents().bindMemory(to: AVBDGPUActiveManifoldListState.self, capacity: 1)
+        activeManifoldStatePtr.pointee = AVBDGPUActiveManifoldListState(count: Int32(0), capacity: Int32(maxCollisions))
+
+        let prevActiveManifoldStatePtr = prevActiveManifoldStateBuffer.contents().bindMemory(to: AVBDGPUActiveManifoldListState.self, capacity: 1)
+        prevActiveManifoldStatePtr.pointee = AVBDGPUActiveManifoldListState(count: Int32(0), capacity: Int32(maxCollisions))
+
+        let activeManifoldIndirectPtr = activeManifoldIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
+        activeManifoldIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+    }
+
+    private static func worldBounds(
+        for mesh: AVBDCollisionMeshBroadphaseMesh
+    ) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
+        let minLocal = mesh.localBoundsMin
+        let maxLocal = mesh.localBoundsMax
+        let corners: [SIMD3<Float>] = [
+            SIMD3<Float>(minLocal.x, minLocal.y, minLocal.z),
+            SIMD3<Float>(maxLocal.x, minLocal.y, minLocal.z),
+            SIMD3<Float>(minLocal.x, maxLocal.y, minLocal.z),
+            SIMD3<Float>(maxLocal.x, maxLocal.y, minLocal.z),
+            SIMD3<Float>(minLocal.x, minLocal.y, maxLocal.z),
+            SIMD3<Float>(maxLocal.x, minLocal.y, maxLocal.z),
+            SIMD3<Float>(minLocal.x, maxLocal.y, maxLocal.z),
+            SIMD3<Float>(maxLocal.x, maxLocal.y, maxLocal.z),
+        ]
+
+        var worldMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var worldMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+
+        for corner in corners {
+            let transformed = mesh.transform * SIMD4<Float>(corner, 1)
+            let world = SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+            worldMin = simd_min(worldMin, world)
+            worldMax = simd_max(worldMax, world)
+        }
+
+        return (worldMin, worldMax)
     }
 
     private func isJointConnected(_ a: Int, _ b: Int) -> Bool {

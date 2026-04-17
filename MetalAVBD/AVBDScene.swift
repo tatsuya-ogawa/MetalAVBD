@@ -9,6 +9,7 @@ import simd
 nonisolated enum AVBDSceneID: CaseIterable {
     case empty
     case ground
+    case armadilloCenter
     case dynamicFriction
     case staticFriction
     case tower
@@ -398,6 +399,9 @@ nonisolated enum AVBDSceneFactory {
             addGround(builder, z: 0)
             _ = builder.rigid(size: SIMD3<Float>(1, 1, 1), density: 1.0, friction: 0.5, position: SIMD3<Float>(0, 0, 4))
 
+        case .armadilloCenter:
+            addGround(builder, z: 0)
+
         case .dynamicFriction:
             addGround(builder, z: 0)
             for x in 0...10 {
@@ -592,6 +596,7 @@ nonisolated enum AVBDSceneFactory {
         switch id {
         case .empty,
              .ground,
+             .armadilloCenter,
              .dynamicFriction,
              .staticFriction,
              .tower,
@@ -1394,6 +1399,7 @@ nonisolated extension AVBDSceneID {
         switch self {
         case .empty: return "Empty"
         case .ground: return "Ground"
+        case .armadilloCenter: return "Armadillo Center"
         case .dynamicFriction: return "Dynamic Friction"
         case .staticFriction: return "Static Friction"
         case .tower: return "Tower"
