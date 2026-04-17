@@ -25,7 +25,7 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         return button
     }()
     private let projectileModeControl: UISegmentedControl = {
-        let control = UISegmentedControl(items: ["Cube", "Sphere", "Torus"])
+        let control = UISegmentedControl(items: ["Cube", "Sphere", "Torus", "Armadillo"])
         control.selectedSegmentIndex = 0
         control.backgroundColor = UIColor(white: 0.08, alpha: 0.82)
         control.selectedSegmentTintColor = UIColor.systemBlue
@@ -74,6 +74,20 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         slider.translatesAutoresizingMaskIntoConstraints = false
         slider.minimumValue = 1.0
         slider.maximumValue = 200.0
+        return slider
+    }()
+    private let projectileFrictionLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        return label
+    }()
+    private let projectileFrictionSlider: UISlider = {
+        let slider = UISlider()
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.minimumValue = 0.0
+        slider.maximumValue = 2.0
         return slider
     }()
     private let torusRenderModeControl: UISegmentedControl = {
@@ -209,6 +223,27 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         toggle.onTintColor = UIColor.systemOrange
         return toggle
     }()
+    private let collisionSDFBoundsContainerView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = UIColor(white: 0.08, alpha: 0.82)
+        view.layer.cornerRadius = 8.0
+        return view
+    }()
+    private let collisionSDFBoundsLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = "Show SDF Debug"
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        return label
+    }()
+    private let collisionSDFBoundsSwitch: UISwitch = {
+        let toggle = UISwitch()
+        toggle.translatesAutoresizingMaskIntoConstraints = false
+        toggle.onTintColor = UIColor.systemRed
+        return toggle
+    }()
     private let simulationStepDeltaContainerView: UIView = {
         let view = UIView()
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -273,6 +308,48 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         slider.maximumValue = 16
         return slider
     }()
+    private let linearDampingContainerView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = UIColor(white: 0.08, alpha: 0.82)
+        view.layer.cornerRadius = 8.0
+        return view
+    }()
+    private let linearDampingLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        return label
+    }()
+    private let linearDampingSlider: UISlider = {
+        let slider = UISlider()
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.minimumValue = 0.0
+        slider.maximumValue = 2.0
+        return slider
+    }()
+    private let angularDampingContainerView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = UIColor(white: 0.08, alpha: 0.82)
+        view.layer.cornerRadius = 8.0
+        return view
+    }()
+    private let angularDampingLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        return label
+    }()
+    private let angularDampingSlider: UISlider = {
+        let slider = UISlider()
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.minimumValue = 0.0
+        slider.maximumValue = 4.0
+        return slider
+    }()
     private let statsContainerView: UIView = {
         let view = UIView()
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -323,7 +400,7 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         }
 
         renderer = newRenderer
-        renderer.setProjectileRenderShape(.box)
+        renderer.setProjectileKind(.box)
         renderer.onDebugStatsUpdated = { [weak self] stats in
             self?.updateStatsLabel(stats)
         }
@@ -361,6 +438,7 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         setupProjectileModeControl()
         setupTorusRenderModeControl()
         setupTorusApproximationControls()
+        setupCollisionSDFBoundsControl()
         setupStatsOverlay()
         setupSimulationParameterControls()
         updateGPUOnlyControlsVisibility()
@@ -388,14 +466,19 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         view.addSubview(projectileMassSlider)
         view.addSubview(projectileSpeedLabel)
         view.addSubview(projectileSpeedSlider)
+        view.addSubview(projectileFrictionLabel)
+        view.addSubview(projectileFrictionSlider)
 
+        projectileModeControl.selectedSegmentIndex = renderer.currentProjectileKind.rawValue
         projectileModeControl.addTarget(self, action: #selector(projectileModeChanged(_:)), for: .valueChanged)
         projectileSizeSlider.value = renderer.currentProjectileSize
         projectileMassSlider.value = renderer.currentProjectileMass
         projectileSpeedSlider.value = renderer.currentProjectileSpeed
+        projectileFrictionSlider.value = renderer.currentProjectileFriction
         projectileSizeSlider.addTarget(self, action: #selector(projectileSizeChanged(_:)), for: .valueChanged)
         projectileMassSlider.addTarget(self, action: #selector(projectileMassChanged(_:)), for: .valueChanged)
         projectileSpeedSlider.addTarget(self, action: #selector(projectileSpeedChanged(_:)), for: .valueChanged)
+        projectileFrictionSlider.addTarget(self, action: #selector(projectileFrictionChanged(_:)), for: .valueChanged)
         updateProjectileLabels()
 
         NSLayoutConstraint.activate([
@@ -419,7 +502,13 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             projectileSpeedLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             projectileSpeedSlider.topAnchor.constraint(equalTo: projectileSpeedLabel.bottomAnchor, constant: 6),
             projectileSpeedSlider.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
-            projectileSpeedSlider.widthAnchor.constraint(equalToConstant: 240)
+            projectileSpeedSlider.widthAnchor.constraint(equalToConstant: 240),
+
+            projectileFrictionLabel.topAnchor.constraint(equalTo: projectileSpeedSlider.bottomAnchor, constant: 10),
+            projectileFrictionLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            projectileFrictionSlider.topAnchor.constraint(equalTo: projectileFrictionLabel.bottomAnchor, constant: 6),
+            projectileFrictionSlider.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            projectileFrictionSlider.widthAnchor.constraint(equalToConstant: 240)
         ])
     }
 
@@ -429,7 +518,7 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         torusRenderModeControl.addTarget(self, action: #selector(torusRenderModeChanged(_:)), for: .valueChanged)
 
         NSLayoutConstraint.activate([
-            torusRenderModeControl.topAnchor.constraint(equalTo: projectileSpeedSlider.bottomAnchor, constant: 12),
+            torusRenderModeControl.topAnchor.constraint(equalTo: projectileFrictionSlider.bottomAnchor, constant: 12),
             torusRenderModeControl.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             torusRenderModeControl.widthAnchor.constraint(equalToConstant: 240)
         ])
@@ -574,6 +663,31 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         ])
     }
 
+    private func setupCollisionSDFBoundsControl() {
+        view.addSubview(collisionSDFBoundsContainerView)
+
+        let stackView = UIStackView(arrangedSubviews: [collisionSDFBoundsLabel, collisionSDFBoundsSwitch])
+        stackView.translatesAutoresizingMaskIntoConstraints = false
+        stackView.axis = .horizontal
+        stackView.alignment = .center
+        stackView.spacing = 10
+
+        collisionSDFBoundsContainerView.addSubview(stackView)
+
+        collisionSDFBoundsSwitch.isOn = renderer.showCollisionMeshSDFBounds
+        collisionSDFBoundsSwitch.addTarget(self, action: #selector(collisionSDFBoundsSwitchChanged(_:)), for: .valueChanged)
+
+        NSLayoutConstraint.activate([
+            collisionSDFBoundsContainerView.topAnchor.constraint(equalTo: torusApproxScaleSlider.bottomAnchor, constant: 12),
+            collisionSDFBoundsContainerView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
+            collisionSDFBoundsContainerView.widthAnchor.constraint(equalToConstant: 240),
+            stackView.topAnchor.constraint(equalTo: collisionSDFBoundsContainerView.topAnchor, constant: 8),
+            stackView.bottomAnchor.constraint(equalTo: collisionSDFBoundsContainerView.bottomAnchor, constant: -8),
+            stackView.leadingAnchor.constraint(equalTo: collisionSDFBoundsContainerView.leadingAnchor, constant: 12),
+            stackView.trailingAnchor.constraint(equalTo: collisionSDFBoundsContainerView.trailingAnchor, constant: -12)
+        ])
+    }
+
     private func setupSimulationParameterControls() {
         view.addSubview(simulationStepDeltaContainerView)
         simulationStepDeltaContainerView.addSubview(simulationStepDeltaLabel)
@@ -589,6 +703,16 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         simulationStepsPerFrameContainerView.addSubview(simulationStepsPerFrameLabel)
         simulationStepsPerFrameContainerView.addSubview(simulationStepsPerFrameSlider)
         simulationStepsPerFrameSlider.addTarget(self, action: #selector(simulationStepsPerFrameChanged(_:)), for: .valueChanged)
+
+        view.addSubview(linearDampingContainerView)
+        linearDampingContainerView.addSubview(linearDampingLabel)
+        linearDampingContainerView.addSubview(linearDampingSlider)
+        linearDampingSlider.addTarget(self, action: #selector(linearDampingChanged(_:)), for: .valueChanged)
+
+        view.addSubview(angularDampingContainerView)
+        angularDampingContainerView.addSubview(angularDampingLabel)
+        angularDampingContainerView.addSubview(angularDampingSlider)
+        angularDampingSlider.addTarget(self, action: #selector(angularDampingChanged(_:)), for: .valueChanged)
 
         NSLayoutConstraint.activate([
             simulationStepDeltaContainerView.topAnchor.constraint(equalTo: gpuOptionsStackView.bottomAnchor, constant: 12),
@@ -618,7 +742,6 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             simulationStepsPerFrameContainerView.topAnchor.constraint(equalTo: solverIterationContainerView.bottomAnchor, constant: 12),
             simulationStepsPerFrameContainerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             simulationStepsPerFrameContainerView.widthAnchor.constraint(equalToConstant: 240),
-            simulationStepsPerFrameContainerView.bottomAnchor.constraint(lessThanOrEqualTo: statsContainerView.topAnchor, constant: -12),
 
             simulationStepsPerFrameLabel.topAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.topAnchor, constant: 8),
             simulationStepsPerFrameLabel.leadingAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.leadingAnchor, constant: 12),
@@ -626,7 +749,32 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             simulationStepsPerFrameSlider.topAnchor.constraint(equalTo: simulationStepsPerFrameLabel.bottomAnchor, constant: 6),
             simulationStepsPerFrameSlider.leadingAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.leadingAnchor, constant: 12),
             simulationStepsPerFrameSlider.trailingAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.trailingAnchor, constant: -12),
-            simulationStepsPerFrameSlider.bottomAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.bottomAnchor, constant: -8)
+            simulationStepsPerFrameSlider.bottomAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.bottomAnchor, constant: -8),
+
+            linearDampingContainerView.topAnchor.constraint(equalTo: simulationStepsPerFrameContainerView.bottomAnchor, constant: 12),
+            linearDampingContainerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            linearDampingContainerView.widthAnchor.constraint(equalToConstant: 240),
+
+            linearDampingLabel.topAnchor.constraint(equalTo: linearDampingContainerView.topAnchor, constant: 8),
+            linearDampingLabel.leadingAnchor.constraint(equalTo: linearDampingContainerView.leadingAnchor, constant: 12),
+            linearDampingLabel.trailingAnchor.constraint(equalTo: linearDampingContainerView.trailingAnchor, constant: -12),
+            linearDampingSlider.topAnchor.constraint(equalTo: linearDampingLabel.bottomAnchor, constant: 6),
+            linearDampingSlider.leadingAnchor.constraint(equalTo: linearDampingContainerView.leadingAnchor, constant: 12),
+            linearDampingSlider.trailingAnchor.constraint(equalTo: linearDampingContainerView.trailingAnchor, constant: -12),
+            linearDampingSlider.bottomAnchor.constraint(equalTo: linearDampingContainerView.bottomAnchor, constant: -8),
+
+            angularDampingContainerView.topAnchor.constraint(equalTo: linearDampingContainerView.bottomAnchor, constant: 12),
+            angularDampingContainerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            angularDampingContainerView.widthAnchor.constraint(equalToConstant: 240),
+            angularDampingContainerView.bottomAnchor.constraint(lessThanOrEqualTo: statsContainerView.topAnchor, constant: -12),
+
+            angularDampingLabel.topAnchor.constraint(equalTo: angularDampingContainerView.topAnchor, constant: 8),
+            angularDampingLabel.leadingAnchor.constraint(equalTo: angularDampingContainerView.leadingAnchor, constant: 12),
+            angularDampingLabel.trailingAnchor.constraint(equalTo: angularDampingContainerView.trailingAnchor, constant: -12),
+            angularDampingSlider.topAnchor.constraint(equalTo: angularDampingLabel.bottomAnchor, constant: 6),
+            angularDampingSlider.leadingAnchor.constraint(equalTo: angularDampingContainerView.leadingAnchor, constant: 12),
+            angularDampingSlider.trailingAnchor.constraint(equalTo: angularDampingContainerView.trailingAnchor, constant: -12),
+            angularDampingSlider.bottomAnchor.constraint(equalTo: angularDampingContainerView.bottomAnchor, constant: -8)
         ])
 
         updateSimulationParameterControls()
@@ -642,21 +790,32 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             "Bodies \(stats.bodyCount)",
             "Mode \(stats.solverModeName) / \(stats.simulationModeName)",
             "Broadphase \(stats.broadphaseModeName)",
-            "Warmstart \(stats.warmstartModeName)"
+            "Warmstart \(stats.warmstartModeName)",
+            "Collision SDF \(stats.collisionSDFStatusName)"
         ].joined(separator: "\n")
     }
 
+    private func showCollisionSDFBusyState() {
+        var stats = renderer.currentDebugStats()
+        stats.collisionSDFStatusName = "Building..."
+        updateStatsLabel(stats)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+    }
+
     @objc private func projectileModeChanged(_ sender: UISegmentedControl) {
-        let shape: AVBDRenderShape
+        let kind: AVBDProjectileKind
         switch sender.selectedSegmentIndex {
         case 1:
-            shape = .sphere
+            kind = .sphere
         case 2:
-            shape = .torus
+            kind = .torus
+        case 3:
+            kind = .armadillo
         default:
-            shape = .box
+            kind = .box
         }
-        renderer.setProjectileRenderShape(shape)
+        renderer.setProjectileKind(kind)
     }
 
     @objc private func projectileSizeChanged(_ sender: UISlider) {
@@ -680,8 +839,16 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         updateProjectileLabels()
     }
 
+    @objc private func projectileFrictionChanged(_ sender: UISlider) {
+        let friction = round(sender.value * 20.0) / 20.0
+        sender.value = friction
+        renderer.setProjectileFriction(friction)
+        updateProjectileLabels()
+    }
+
     @objc private func solverModeChanged(_ sender: UISegmentedControl) {
         let mode: AVBDSolverMode = sender.selectedSegmentIndex == 0 ? .gpu : .cpu
+        showCollisionSDFBusyState()
         renderer.setSolverMode(mode)
         sender.selectedSegmentIndex = renderer.currentSolverMode == .cpu ? 1 : 0
         updateGPUOnlyControlsVisibility()
@@ -720,6 +887,7 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         projectileSizeLabel.text = String(format: "Projectile Size: %.2f", renderer.currentProjectileSize)
         projectileMassLabel.text = String(format: "Projectile Mass: %.1f", renderer.currentProjectileMass)
         projectileSpeedLabel.text = String(format: "Projectile Speed: %.0f", renderer.currentProjectileSpeed)
+        projectileFrictionLabel.text = String(format: "Projectile Friction: %.2f", renderer.currentProjectileFriction)
     }
 
     private func updateSimulationParameterControls() {
@@ -728,9 +896,13 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         simulationStepDeltaSlider.value = Float(hz)
         solverIterationSlider.value = Float(renderer.currentSolverIterationCount)
         simulationStepsPerFrameSlider.value = Float(renderer.currentSimulationStepsPerFrame)
+        linearDampingSlider.value = renderer.currentLinearDamping
+        angularDampingSlider.value = renderer.currentAngularDamping
         simulationStepDeltaLabel.text = String(format: "Step dt: %.2f ms (%.0f Hz)", dt * 1000.0, hz.rounded())
         solverIterationLabel.text = "Iterations / step: \(renderer.currentSolverIterationCount)"
         simulationStepsPerFrameLabel.text = "Steps / frame: \(renderer.currentSimulationStepsPerFrame)"
+        linearDampingLabel.text = String(format: "Linear Damping: %.2f", renderer.currentLinearDamping)
+        angularDampingLabel.text = String(format: "Angular Damping: %.2f", renderer.currentAngularDamping)
     }
 
     @objc private func simulationModeChanged(_ sender: UISegmentedControl) {
@@ -761,6 +933,20 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         updateSimulationParameterControls()
     }
 
+    @objc private func linearDampingChanged(_ sender: UISlider) {
+        let damping = round(sender.value * 20.0) / 20.0
+        sender.value = damping
+        renderer.setLinearDamping(damping)
+        updateSimulationParameterControls()
+    }
+
+    @objc private func angularDampingChanged(_ sender: UISlider) {
+        let damping = round(sender.value * 20.0) / 20.0
+        sender.value = damping
+        renderer.setAngularDamping(damping)
+        updateSimulationParameterControls()
+    }
+
     @objc private func broadphaseRefreshChanged(_ sender: UISlider) {
         let stepCount = Int(sender.value.rounded())
         sender.value = Float(stepCount)
@@ -774,12 +960,15 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
     }
 
     @objc private func resetButtonTapped(_ sender: UIButton) {
+        showCollisionSDFBusyState()
         renderer.resetSimulation()
         solverModeControl.selectedSegmentIndex = renderer.currentSolverMode == .cpu ? 1 : 0
         broadphaseRefreshSlider.value = Float(renderer.currentBroadphaseFullRefreshStepCount)
         warmstartSwitch.isOn = renderer.enableContactWarmstart
+        collisionSDFBoundsSwitch.isOn = renderer.showCollisionMeshSDFBounds
         updateBroadphaseRefreshLabel()
         updateGPUOnlyControlsVisibility()
+        updateProjectileLabels()
         updateSimulationControls()
         updateSimulationParameterControls()
         updateStatsLabel(renderer.currentDebugStats())
@@ -787,6 +976,11 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
 
     @objc private func warmstartSwitchChanged(_ sender: UISwitch) {
         renderer.setContactWarmstartEnabled(sender.isOn)
+        updateStatsLabel(renderer.currentDebugStats())
+    }
+
+    @objc private func collisionSDFBoundsSwitchChanged(_ sender: UISwitch) {
+        renderer.setShowCollisionMeshSDFBounds(sender.isOn)
         updateStatsLabel(renderer.currentDebugStats())
     }
 
@@ -805,6 +999,7 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         let isGPU = renderer.currentSolverMode == .gpu
         broadphaseRefreshContainerView.isHidden = !isGPU
         warmstartContainerView.isHidden = !isGPU
+        collisionSDFBoundsContainerView.isHidden = !isGPU
     }
 
     @objc private func sceneButtonTapped(_ sender: UIButton) {
@@ -813,13 +1008,16 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             let title = sceneID == renderer.currentSceneID ? "✓ \(sceneID.displayName)" : sceneID.displayName
             alert.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
                 guard let self else { return }
+                self.showCollisionSDFBusyState()
                 self.renderer.setScene(sceneID)
                 self.updateSceneButtonTitle()
                 self.solverModeControl.selectedSegmentIndex = self.renderer.currentSolverMode == .cpu ? 1 : 0
                 self.broadphaseRefreshSlider.value = Float(self.renderer.currentBroadphaseFullRefreshStepCount)
                 self.warmstartSwitch.isOn = self.renderer.enableContactWarmstart
+                self.collisionSDFBoundsSwitch.isOn = self.renderer.showCollisionMeshSDFBounds
                 self.updateBroadphaseRefreshLabel()
                 self.updateGPUOnlyControlsVisibility()
+                self.updateProjectileLabels()
                 self.updateSimulationParameterControls()
                 self.updateStatsLabel(self.renderer.currentDebugStats())
             })

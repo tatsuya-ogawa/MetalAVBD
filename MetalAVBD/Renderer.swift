@@ -8,6 +8,7 @@
 // Our platform independent renderer class
 
 import Dispatch
+import Foundation
 import Metal
 import MetalKit
 import QuartzCore
@@ -58,6 +59,22 @@ nonisolated enum AVBDTorusVisualMode: Int {
     }
 }
 
+nonisolated enum AVBDProjectileKind: Int {
+    case box
+    case sphere
+    case torus
+    case armadillo
+
+    var displayName: String {
+        switch self {
+        case .box: return "Cube"
+        case .sphere: return "Sphere"
+        case .torus: return "Torus"
+        case .armadillo: return "Armadillo"
+        }
+    }
+}
+
 nonisolated struct StaticMesh {
     var positions: MTLBuffer
     var normals: MTLBuffer
@@ -74,9 +91,27 @@ struct RendererDebugStats: Sendable {
     var simulationModeName: String
     var broadphaseModeName: String
     var warmstartModeName: String
+    var collisionSDFStatusName: String
+}
+
+private struct ArmadilloRenderProxy {
+    var bodyIndex: Int
+    var baseColor: SIMD4<Float>
+}
+
+private struct SceneArmadilloPlacement {
+    var modelMatrix: simd_float4x4
+    var position: SIMD3<Float>
+    var orientation: simd_quatf
+    var targetSize: Float
+    var color: SIMD4<Float>
 }
 
 class Renderer: NSObject, MTKViewDelegate {
+    // Set `AVBD_ARMADILLO_PRELOAD=0` in the scheme environment to skip the
+    // shared Armadillo SDF preload path.
+    private static let enableArmadilloCollisionPreload =
+        ProcessInfo.processInfo.environment["AVBD_ARMADILLO_PRELOAD"] != "0"
     private static let minProjectileSize: Float = 0.25
     private static let maxProjectileSize: Float = 20.0
     private static let defaultProjectileSize: Float = 1.5
@@ -86,6 +121,17 @@ class Renderer: NSObject, MTKViewDelegate {
     private static let minProjectileSpeed: Float = 1.0
     private static let maxProjectileSpeed: Float = 200.0
     private static let defaultProjectileSpeed: Float = 60.0
+    private static let minProjectileFriction: Float = 0.0
+    private static let maxProjectileFriction: Float = 2.0
+    private static let defaultProjectileFriction: Float = 0.5
+    private static let centerSceneArmadilloTargetSize: Float = 18.0
+    private static let centerSceneArmadilloColor = SIMD4<Float>(0.63, 0.66, 0.61, 1.0)
+    private static let minLinearDamping: Float = 0.0
+    private static let maxLinearDamping: Float = 2.0
+    private static let defaultLinearDamping: Float = 0.15
+    private static let minAngularDamping: Float = 0.0
+    private static let maxAngularDamping: Float = 4.0
+    private static let defaultAngularDamping: Float = 0.75
 
     public let device: MTLDevice
 
@@ -95,6 +141,7 @@ class Renderer: NSObject, MTKViewDelegate {
     let commandAllocators: [MTL4CommandAllocator]
     let commandQueueResidencySet: MTLResidencySet
     let vertexArgumentTable: MTL4ArgumentTable
+    let fragmentArgumentTable: MTL4ArgumentTable
 #endif
 
     let endFrameEvent: MTLSharedEvent
@@ -104,8 +151,12 @@ class Renderer: NSObject, MTKViewDelegate {
     var instanceBuffer: MTLBuffer
     var sphereInstanceBuffer: MTLBuffer
     var torusInstanceBuffer: MTLBuffer
+    var armadilloInstanceBuffer: MTLBuffer
+    var sdfDebugInstanceBuffer: MTLBuffer
     var pipelineState: MTLRenderPipelineState
+    var sdfDebugPipelineState: MTLRenderPipelineState
     var depthState: MTLDepthStencilState
+    var debugDepthState: MTLDepthStencilState
 
     var uniformBufferOffset = 0
     var instanceBufferOffset = 0
@@ -120,6 +171,12 @@ class Renderer: NSObject, MTKViewDelegate {
     var boxMesh: MTKMesh
     var sphereMesh: MTKMesh
     var torusMesh: StaticMesh
+    var armadilloMesh: StaticMesh?
+    private var collisionMeshBroadphaseMeshes: [AVBDCollisionMeshBroadphaseMesh] = []
+    private var armadilloTestAsset: AVBDTriangleMeshAsset?
+    private var armadilloTestASBuilder: AVBDTriangleMeshAccelerationStructureBuilder?
+    private var armadilloTestAS: AVBDTriangleMeshAccelerationStructureBuildResult?
+    private var armadilloDynamicRenderProxies: [ArmadilloRenderProxy] = []
     var solver: AVBDSolver
     var gpuSolver: AVBDGPUSolver?
     var computeCommandQueue: MTLCommandQueue?
@@ -132,11 +189,22 @@ class Renderer: NSObject, MTKViewDelegate {
     var boxInstanceCount = 0
     var sphereInstanceCount = 0
     var torusInstanceCount = 0
-    var projectileRenderShape: AVBDRenderShape = .box
+    var armadilloInstanceCount = 0
+    var sdfDebugInstanceCount = 0
+    private(set) var currentProjectileKind: AVBDProjectileKind = .box
     private(set) var currentProjectileSize: Float = Renderer.defaultProjectileSize
     private(set) var currentProjectileMass: Float = Renderer.defaultProjectileMass
     private(set) var currentProjectileSpeed: Float = Renderer.defaultProjectileSpeed
+    private(set) var currentProjectileFriction: Float = Renderer.defaultProjectileFriction
+    private(set) var currentLinearDamping: Float = Renderer.defaultLinearDamping
+    private(set) var currentAngularDamping: Float = Renderer.defaultAngularDamping
     private var pendingManualSteps = 0
+    private let armadilloCollisionPreloadQueue = DispatchQueue(
+        label: "MetalAVBD.Renderer.ArmadilloCollisionPreload",
+        qos: .utility
+    )
+    private var armadilloCollisionPreloadRequestID: UInt64 = 0
+    private var collisionSDFStatusOverride: String?
     private let cameraTarget = SIMD3<Float>(0, 0, 5.0)
     private var cameraDistance: Float = 50.0
     private var cameraAzimuth: Float = radians_from_degrees(90.0)
@@ -153,6 +221,7 @@ class Renderer: NSObject, MTKViewDelegate {
     private var lastDebugStatsPublishTimestamp: CFTimeInterval = 0
     private var completedSimulationStepCount = 0
     private var sceneDefaults = AVBDSceneDefaults()
+    private(set) var showCollisionMeshSDFBounds = false
     var onDebugStatsUpdated: ((RendererDebugStats) -> Void)?
 
     var currentBroadphaseFullRefreshStepCount: Int { sceneDefaults.broadphaseFullRefreshStepCount }
@@ -173,6 +242,9 @@ class Renderer: NSObject, MTKViewDelegate {
         let argTableDesc = MTL4ArgumentTableDescriptor()
         argTableDesc.maxBufferBindCount = 4
         self.vertexArgumentTable = try! device.makeArgumentTable(descriptor: argTableDesc)
+        let fragmentArgTableDesc = MTL4ArgumentTableDescriptor()
+        fragmentArgTableDesc.maxBufferBindCount = 3
+        self.fragmentArgumentTable = try! device.makeArgumentTable(descriptor: fragmentArgTableDesc)
 
         self.endFrameEvent = device.makeSharedEvent()!
         frameIndex = maxBuffersInFlight
@@ -223,6 +295,20 @@ class Renderer: NSObject, MTKViewDelegate {
             torusInstanceBuffer = torusInstances
             self.torusInstanceBuffer.label = "AVBDTorusInstanceBuffer"
 
+            guard let armadilloInstances = self.device.makeBuffer(
+                length: instanceBufferFrameStride * maxBuffersInFlight,
+                options: [MTLResourceOptions.storageModeShared]
+            ) else { return nil }
+            armadilloInstanceBuffer = armadilloInstances
+            self.armadilloInstanceBuffer.label = "AVBDArmadilloInstanceBuffer"
+
+            guard let sdfDebugInstances = self.device.makeBuffer(
+                length: instanceBufferFrameStride * maxBuffersInFlight,
+                options: [MTLResourceOptions.storageModeShared]
+            ) else { return nil }
+            sdfDebugInstanceBuffer = sdfDebugInstances
+            self.sdfDebugInstanceBuffer.label = "AVBDSDFDebugInstanceBuffer"
+
             metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
             metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
             metalKitView.sampleCount = 1
@@ -234,6 +320,9 @@ class Renderer: NSObject, MTKViewDelegate {
                 pipelineState = try Renderer.buildRenderPipelineWithDevice(device: device,
                                                                            metalKitView: metalKitView,
                                                                            mtlVertexDescriptor: pipelineVertexDescriptor)
+                sdfDebugPipelineState = try Renderer.buildSDFDebugRenderPipelineWithDevice(device: device,
+                                                                                           metalKitView: metalKitView,
+                                                                                           mtlVertexDescriptor: pipelineVertexDescriptor)
             } catch {
                 print("Unable to compile render pipeline state.  Error info: \(error)")
                 return nil
@@ -244,6 +333,11 @@ class Renderer: NSObject, MTKViewDelegate {
             depthStateDescriptor.isDepthWriteEnabled = true
             guard let state = device.makeDepthStencilState(descriptor: depthStateDescriptor) else { return nil }
             depthState = state
+            let debugDepthStateDescriptor = MTLDepthStencilDescriptor()
+            debugDepthStateDescriptor.depthCompareFunction = .lessEqual
+            debugDepthStateDescriptor.isDepthWriteEnabled = false
+            guard let debugState = device.makeDepthStencilState(descriptor: debugDepthStateDescriptor) else { return nil }
+            debugDepthState = debugState
 
             do {
                 boxMesh = try Renderer.buildMesh(device: device, mtlVertexDescriptor: meshVertexDescriptor, shape: .box)
@@ -265,7 +359,7 @@ class Renderer: NSObject, MTKViewDelegate {
             residencySet.addAllocations(sphereMesh.vertexBuffers.map { $0.buffer })
             residencySet.addAllocations(sphereMesh.submeshes.map { $0.indexBuffer.buffer })
             residencySet.addAllocations([torusMesh.positions, torusMesh.normals, torusMesh.indexBuffer])
-            residencySet.addAllocations([dynamicUniformBuffer, instanceBuffer, sphereInstanceBuffer, torusInstanceBuffer])
+            residencySet.addAllocations([dynamicUniformBuffer, instanceBuffer, sphereInstanceBuffer, torusInstanceBuffer, armadilloInstanceBuffer, sdfDebugInstanceBuffer])
             residencySet.commit()
             commandQueue.addResidencySet(residencySet)
             commandQueueResidencySet = residencySet
@@ -275,6 +369,7 @@ class Renderer: NSObject, MTKViewDelegate {
             applySimulationParameters()
             updateViewMatrix()
             populateRenderInstances()
+            beginStanfordArmadilloTestLoad()
             return
         }
         self.gpuSolver = gpuSolver
@@ -301,6 +396,20 @@ class Renderer: NSObject, MTKViewDelegate {
         torusInstanceBuffer = torusInstances
         self.torusInstanceBuffer.label = "AVBDTorusInstanceBuffer"
 
+        guard let armadilloInstances = self.device.makeBuffer(
+            length: instanceBufferFrameStride * maxBuffersInFlight,
+            options: [MTLResourceOptions.storageModeShared]
+        ) else { return nil }
+        armadilloInstanceBuffer = armadilloInstances
+        self.armadilloInstanceBuffer.label = "AVBDArmadilloInstanceBuffer"
+
+        guard let sdfDebugInstances = self.device.makeBuffer(
+            length: instanceBufferFrameStride * maxBuffersInFlight,
+            options: [MTLResourceOptions.storageModeShared]
+        ) else { return nil }
+        sdfDebugInstanceBuffer = sdfDebugInstances
+        self.sdfDebugInstanceBuffer.label = "AVBDSDFDebugInstanceBuffer"
+
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
         metalKitView.sampleCount = 1
@@ -312,6 +421,9 @@ class Renderer: NSObject, MTKViewDelegate {
             pipelineState = try Renderer.buildRenderPipelineWithDevice(device: device,
                                                                        metalKitView: metalKitView,
                                                                        mtlVertexDescriptor: pipelineVertexDescriptor)
+            sdfDebugPipelineState = try Renderer.buildSDFDebugRenderPipelineWithDevice(device: device,
+                                                                                       metalKitView: metalKitView,
+                                                                                       mtlVertexDescriptor: pipelineVertexDescriptor)
         } catch {
             print("Unable to compile render pipeline state.  Error info: \(error)")
             return nil
@@ -322,6 +434,11 @@ class Renderer: NSObject, MTKViewDelegate {
         depthStateDescriptor.isDepthWriteEnabled = true
         guard let state = device.makeDepthStencilState(descriptor: depthStateDescriptor) else { return nil }
         depthState = state
+        let debugDepthStateDescriptor = MTLDepthStencilDescriptor()
+        debugDepthStateDescriptor.depthCompareFunction = .lessEqual
+        debugDepthStateDescriptor.isDepthWriteEnabled = false
+        guard let debugState = device.makeDepthStencilState(descriptor: debugDepthStateDescriptor) else { return nil }
+        debugDepthState = debugState
 
         do {
             boxMesh = try Renderer.buildMesh(device: device, mtlVertexDescriptor: meshVertexDescriptor, shape: .box)
@@ -343,7 +460,7 @@ class Renderer: NSObject, MTKViewDelegate {
         residencySet.addAllocations(sphereMesh.vertexBuffers.map { $0.buffer })
         residencySet.addAllocations(sphereMesh.submeshes.map { $0.indexBuffer.buffer })
         residencySet.addAllocations([torusMesh.positions, torusMesh.normals, torusMesh.indexBuffer])
-        residencySet.addAllocations([dynamicUniformBuffer, instanceBuffer, sphereInstanceBuffer, torusInstanceBuffer])
+        residencySet.addAllocations([dynamicUniformBuffer, instanceBuffer, sphereInstanceBuffer, torusInstanceBuffer, armadilloInstanceBuffer, sdfDebugInstanceBuffer])
         residencySet.commit()
         commandQueue.addResidencySet(residencySet)
         commandQueueResidencySet = residencySet
@@ -355,7 +472,321 @@ class Renderer: NSObject, MTKViewDelegate {
         self.gpuSolver?.enableContactWarmstart = enableContactWarmstart
         updateViewMatrix()
         populateRenderInstances()
+        beginStanfordArmadilloTestLoad()
 #endif
+    }
+
+    private func beginStanfordArmadilloTestLoad() {
+        guard let computeCommandQueue else {
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            do {
+                let loader = AVBDStanfordArmadilloLoader(device: self.device)
+                let asset = try loader.load()
+
+                guard let builder = AVBDTriangleMeshAccelerationStructureBuilder(
+                    device: self.device,
+                    commandQueue: computeCommandQueue
+                ) else {
+                    print("Failed to create Stanford Armadillo AS builder.")
+                    return
+                }
+
+                let result = try builder.build(
+                    geometries: [asset.makeGeometry(label: "StanfordArmadillo")],
+                    instances: [.identity(geometryIndex: 0)]
+                )
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.armadilloTestAsset = asset
+                    self?.armadilloMesh = asset.makeStaticMesh()
+                    self?.armadilloTestASBuilder = builder
+                    self?.armadilloTestAS = result
+                    self?.addArmadilloResourcesToResidencySetIfNeeded()
+                    self?.rebuildSceneCollisionMeshes()
+                    self?.applyCollisionMeshesToGPUSolver(fullRebuild: true)
+                    self?.scheduleArmadilloCollisionResourcePreloadIfNeeded()
+                    self?.populateRenderInstances()
+                }
+
+                print(
+                    """
+                    Stanford Armadillo loaded from \(asset.sourceURL.absoluteString)
+                    Cache: \(asset.cachePLYURL.path)
+                    Vertices: \(asset.vertexCount), Triangles: \(asset.indexCount / 3)
+                    """
+                )
+            } catch {
+                print("Failed to load Stanford Armadillo test asset: \(error)")
+            }
+        }
+    }
+
+    private func addArmadilloResourcesToResidencySetIfNeeded() {
+#if !targetEnvironment(simulator)
+        guard let armadilloMesh else {
+            return
+        }
+        commandQueueResidencySet.addAllocations([
+            armadilloMesh.positions,
+            armadilloMesh.normals,
+            armadilloMesh.indexBuffer
+        ])
+        commandQueueResidencySet.commit()
+#endif
+    }
+
+    private func applyCollisionMeshesToGPUSolver(fullRebuild: Bool = false) {
+        guard let gpuSolver else {
+            return
+        }
+
+        if fullRebuild || !gpuSolver.updateCollisionMeshInstances(collisionMeshBroadphaseMeshes) {
+            gpuSolver.setCollisionMeshes(collisionMeshBroadphaseMeshes)
+            addCollisionMeshSDFResourcesToResidencySetIfNeeded()
+        }
+    }
+
+    private func armadilloCollisionResourceTemplate() -> AVBDCollisionMeshBroadphaseMesh? {
+        guard let armadilloTestAsset else {
+            return nil
+        }
+        return AVBDCollisionMeshBroadphaseMesh(
+            sdfResourceID: "stanford-armadillo",
+            ownerBodyIndex: -1,
+            localBoundsMin: armadilloTestAsset.boundsMin,
+            localBoundsMax: armadilloTestAsset.boundsMax,
+            transform: matrix_identity_float4x4,
+            positions: armadilloTestAsset.positionData,
+            indices: armadilloTestAsset.indexData
+        )
+    }
+
+    private func scheduleArmadilloCollisionResourcePreloadIfNeeded() {
+        guard Renderer.enableArmadilloCollisionPreload,
+              let preloadSolver = gpuSolver,
+              let preloadMesh = armadilloCollisionResourceTemplate() else {
+            collisionSDFStatusOverride = nil
+            return
+        }
+
+        armadilloCollisionPreloadRequestID &+= 1
+        let requestID = armadilloCollisionPreloadRequestID
+        collisionSDFStatusOverride = "Preloading..."
+
+        armadilloCollisionPreloadQueue.async { [weak self] in
+            let didPrepare = preloadSolver.prepareCollisionMeshSDFCache(preloadMesh)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                guard requestID == self.armadilloCollisionPreloadRequestID else {
+                    return
+                }
+
+                defer {
+                    self.collisionSDFStatusOverride = nil
+                }
+
+                guard didPrepare, let gpuSolver = self.gpuSolver else {
+                    return
+                }
+
+                _ = gpuSolver.prewarmCollisionMeshResource(preloadMesh)
+                self.addCollisionMeshSDFResourcesToResidencySetIfNeeded()
+            }
+        }
+    }
+
+    private func armadilloModelMatrix(
+        position: SIMD3<Float>,
+        orientation: simd_quatf,
+        targetSize: Float
+    ) -> simd_float4x4? {
+        guard let armadilloTestAsset else {
+            return nil
+        }
+
+        let span = armadilloTestAsset.boundsMax - armadilloTestAsset.boundsMin
+        let maxExtent = max(span.x, max(span.y, span.z))
+        let scale = maxExtent > 0 ? targetSize / maxExtent : 1.0
+        return simd_mul(
+            matrix4x4_translation(position.x, position.y, position.z),
+            simd_mul(
+                matrix4x4_rotation(quaternion: orientation),
+                simd_mul(
+                    matrix4x4_scale(scale, scale, scale),
+                    matrix4x4_translation(-armadilloTestAsset.boundsCenter.x, -armadilloTestAsset.boundsCenter.y, -armadilloTestAsset.boundsCenter.z)
+                )
+            )
+        )
+    }
+
+    private func rebuildCollisionMeshes(dynamicBodies: [AVBDGPUBody] = []) {
+        collisionMeshBroadphaseMeshes.removeAll(keepingCapacity: true)
+
+        if currentSceneID == .armadilloCenter,
+           let armadilloTestAsset,
+           let placement = sceneArmadilloPlacement() {
+            collisionMeshBroadphaseMeshes.append(
+                AVBDCollisionMeshBroadphaseMesh(
+                    sdfResourceID: "stanford-armadillo",
+                    ownerBodyIndex: -1,
+                    localBoundsMin: armadilloTestAsset.boundsMin,
+                    localBoundsMax: armadilloTestAsset.boundsMax,
+                    transform: placement.modelMatrix,
+                    positions: armadilloTestAsset.positionData,
+                    indices: armadilloTestAsset.indexData
+                )
+            )
+        }
+
+        guard let armadilloTestAsset else {
+            return
+        }
+
+        let proxies = filteredArmadilloRenderProxies(bodyCount: dynamicBodies.count)
+        for proxy in proxies {
+            guard proxy.bodyIndex >= 0, proxy.bodyIndex < dynamicBodies.count else {
+                continue
+            }
+            let body = dynamicBodies[proxy.bodyIndex]
+            let orientation = simd_quatf(vector: body.positionAng)
+            guard let modelMatrix = armadilloModelMatrix(
+                position: body.positionLin,
+                orientation: orientation,
+                targetSize: projectileRenderSize(for: body.size, projectileKind: .armadillo)
+            ) else {
+                continue
+            }
+            collisionMeshBroadphaseMeshes.append(
+                AVBDCollisionMeshBroadphaseMesh(
+                    sdfResourceID: "stanford-armadillo",
+                    ownerBodyIndex: proxy.bodyIndex,
+                    localBoundsMin: armadilloTestAsset.boundsMin,
+                    localBoundsMax: armadilloTestAsset.boundsMax,
+                    transform: modelMatrix,
+                    positions: armadilloTestAsset.positionData,
+                    indices: armadilloTestAsset.indexData
+                )
+            )
+        }
+    }
+
+    private func appendDynamicArmadilloCollisionMesh(
+        bodyIndex: Int,
+        position: SIMD3<Float>,
+        orientation: simd_quatf,
+        size: SIMD3<Float>
+    ) {
+        guard let armadilloTestAsset,
+              let modelMatrix = armadilloModelMatrix(
+                position: position,
+                orientation: orientation,
+                targetSize: projectileRenderSize(for: size, projectileKind: .armadillo)
+              ) else {
+            return
+        }
+
+        collisionMeshBroadphaseMeshes.append(
+            AVBDCollisionMeshBroadphaseMesh(
+                sdfResourceID: "stanford-armadillo",
+                ownerBodyIndex: bodyIndex,
+                localBoundsMin: armadilloTestAsset.boundsMin,
+                localBoundsMax: armadilloTestAsset.boundsMax,
+                transform: modelMatrix,
+                positions: armadilloTestAsset.positionData,
+                indices: armadilloTestAsset.indexData
+            )
+        )
+    }
+
+    private func addCollisionMeshSDFResourcesToResidencySetIfNeeded() {
+#if !targetEnvironment(simulator)
+        guard let gpuSolver else {
+            return
+        }
+
+        var allocations: [any MTLAllocation] = []
+        if let infoBuffer = gpuSolver.collisionMeshDebugInfoBuffer {
+            allocations.append(infoBuffer)
+        }
+        if let sdfArgumentBuffer = gpuSolver.collisionMeshDebugSDFArgumentBuffer {
+            allocations.append(sdfArgumentBuffer)
+        }
+        allocations.append(contentsOf: gpuSolver.collisionMeshDebugTextures)
+
+        guard !allocations.isEmpty else {
+            return
+        }
+
+        commandQueueResidencySet.addAllocations(allocations)
+        commandQueueResidencySet.commit()
+#endif
+    }
+
+    private func sceneArmadilloPlacement() -> SceneArmadilloPlacement? {
+        guard currentSceneID == .armadilloCenter,
+              let armadilloTestAsset else {
+            return nil
+        }
+
+        let targetSize = Self.centerSceneArmadilloTargetSize
+        let span = armadilloTestAsset.boundsMax - armadilloTestAsset.boundsMin
+        let maxExtent = max(span.x, max(span.y, span.z))
+        let scale = maxExtent > 0 ? targetSize / maxExtent : 1.0
+        let groundHeight: Float = 0.5
+        let orientation = simd_quatf(angle: .pi * 0.5, axis: SIMD3<Float>(1, 0, 0))
+        let centeredLocalTransform = simd_mul(
+            matrix4x4_rotation(quaternion: orientation),
+            simd_mul(
+                matrix4x4_scale(scale, scale, scale),
+                matrix4x4_translation(-armadilloTestAsset.boundsCenter.x, -armadilloTestAsset.boundsCenter.y, -armadilloTestAsset.boundsCenter.z)
+            )
+        )
+
+        let localBoundsMin = armadilloTestAsset.boundsMin
+        let localBoundsMax = armadilloTestAsset.boundsMax
+        let corners: [SIMD3<Float>] = [
+            SIMD3<Float>(localBoundsMin.x, localBoundsMin.y, localBoundsMin.z),
+            SIMD3<Float>(localBoundsMax.x, localBoundsMin.y, localBoundsMin.z),
+            SIMD3<Float>(localBoundsMin.x, localBoundsMax.y, localBoundsMin.z),
+            SIMD3<Float>(localBoundsMax.x, localBoundsMax.y, localBoundsMin.z),
+            SIMD3<Float>(localBoundsMin.x, localBoundsMin.y, localBoundsMax.z),
+            SIMD3<Float>(localBoundsMax.x, localBoundsMin.y, localBoundsMax.z),
+            SIMD3<Float>(localBoundsMin.x, localBoundsMax.y, localBoundsMax.z),
+            SIMD3<Float>(localBoundsMax.x, localBoundsMax.y, localBoundsMax.z),
+        ]
+
+        var transformedMinZ = Float.greatestFiniteMagnitude
+        for corner in corners {
+            let transformed = centeredLocalTransform * SIMD4<Float>(corner, 1)
+            transformedMinZ = min(transformedMinZ, transformed.z)
+        }
+
+        let position = SIMD3<Float>(0, 0, groundHeight - transformedMinZ)
+        let modelMatrix = simd_mul(
+            matrix4x4_translation(position.x, position.y, position.z),
+            centeredLocalTransform
+        )
+
+        return SceneArmadilloPlacement(
+            modelMatrix: modelMatrix,
+            position: position,
+            orientation: orientation,
+            targetSize: targetSize,
+            color: Self.centerSceneArmadilloColor
+        )
+    }
+
+    private func rebuildSceneCollisionMeshes() {
+        rebuildCollisionMeshes()
     }
 
     class func buildMeshVertexDescriptor() -> MTLVertexDescriptor {
@@ -442,6 +873,38 @@ class Renderer: NSObject, MTKViewDelegate {
         pipelineDescriptor.vertexDescriptor = mtlVertexDescriptor
 
         pipelineDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
+
+        return try compiler.makeRenderPipelineState(descriptor: pipelineDescriptor)
+    }
+
+    @MainActor
+    class func buildSDFDebugRenderPipelineWithDevice(device: MTLDevice,
+                                                     metalKitView: MTKView,
+                                                     mtlVertexDescriptor: MTLVertexDescriptor) throws -> MTLRenderPipelineState {
+        let library = device.makeDefaultLibrary()
+        let compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
+
+        let vertexFunctionDescriptor = MTL4LibraryFunctionDescriptor()
+        vertexFunctionDescriptor.library = library
+        vertexFunctionDescriptor.name = "sdfDebugVertexShader"
+        let fragmentFunctionDescriptor = MTL4LibraryFunctionDescriptor()
+        fragmentFunctionDescriptor.library = library
+        fragmentFunctionDescriptor.name = "sdfDebugFragmentShader"
+
+        let pipelineDescriptor = MTL4RenderPipelineDescriptor()
+        pipelineDescriptor.label = "AVBDSDFDebugRenderPipeline"
+        pipelineDescriptor.rasterSampleCount = metalKitView.sampleCount
+        pipelineDescriptor.vertexFunctionDescriptor = vertexFunctionDescriptor
+        pipelineDescriptor.fragmentFunctionDescriptor = fragmentFunctionDescriptor
+        pipelineDescriptor.vertexDescriptor = mtlVertexDescriptor
+        pipelineDescriptor.colorAttachments[0].pixelFormat = metalKitView.colorPixelFormat
+        pipelineDescriptor.colorAttachments[0].blendingState = .enabled
+        pipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        pipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         return try compiler.makeRenderPipelineState(descriptor: pipelineDescriptor)
     }
@@ -579,7 +1042,12 @@ class Renderer: NSObject, MTKViewDelegate {
         /// Update any game state before rendering
 
         updateViewMatrix()
-        uniforms[0].viewProjectionMatrix = simd_mul(projectionMatrix, viewMatrix)
+        let cameraEye = orbitEye(distance: cameraDistance, azimuth: cameraAzimuth, elevation: cameraElevation, target: cameraTarget)
+        let viewProjectionMatrix = simd_mul(projectionMatrix, viewMatrix)
+        uniforms[0].viewProjectionMatrix = viewProjectionMatrix
+        uniforms[0].inverseViewProjectionMatrix = viewProjectionMatrix.inverse
+        uniforms[0].cameraWorldPosition = cameraEye
+        uniforms[0].padding0 = 0
     }
 
     private var currentBodyCount: Int {
@@ -611,6 +1079,16 @@ class Renderer: NSObject, MTKViewDelegate {
         return enableContactWarmstart ? "On" : "Off"
     }
 
+    private var currentCollisionSDFStatusName: String {
+        if let collisionSDFStatusOverride {
+            return collisionSDFStatusOverride
+        }
+        guard currentSolverMode == .gpu, let gpuSolver else {
+            return collisionMeshBroadphaseMeshes.isEmpty ? "Idle" : "CPU"
+        }
+        return gpuSolver.collisionMeshSDFStatusText
+    }
+
     private func publishDebugStatsIfNeeded(frameTimestamp: CFTimeInterval) {
         if let lastFrameTimestamp {
             accumulatedFrameTime += frameTimestamp - lastFrameTimestamp
@@ -630,7 +1108,8 @@ class Renderer: NSObject, MTKViewDelegate {
             solverModeName: currentSolverMode.displayName,
             simulationModeName: currentSimulationRunMode.displayName,
             broadphaseModeName: currentBroadphaseModeName,
-            warmstartModeName: currentWarmstartModeName
+            warmstartModeName: currentWarmstartModeName,
+            collisionSDFStatusName: currentCollisionSDFStatusName
         )
 
         accumulatedFrameTime = 0
@@ -665,12 +1144,19 @@ class Renderer: NSObject, MTKViewDelegate {
             solverModeName: currentSolverMode.displayName,
             simulationModeName: currentSimulationRunMode.displayName,
             broadphaseModeName: currentBroadphaseModeName,
-            warmstartModeName: currentWarmstartModeName
+            warmstartModeName: currentWarmstartModeName,
+            collisionSDFStatusName: currentCollisionSDFStatusName
         )
     }
 
-    func setProjectileRenderShape(_ shape: AVBDRenderShape) {
-        projectileRenderShape = shape
+    @MainActor
+    func setShowCollisionMeshSDFBounds(_ enabled: Bool) {
+        showCollisionMeshSDFBounds = enabled
+        populateRenderInstances()
+    }
+
+    func setProjectileKind(_ kind: AVBDProjectileKind) {
+        currentProjectileKind = kind
     }
 
     func setProjectileSize(_ size: Float) {
@@ -683,6 +1169,22 @@ class Renderer: NSObject, MTKViewDelegate {
 
     func setProjectileSpeed(_ speed: Float) {
         currentProjectileSpeed = clamp(speed, min: Self.minProjectileSpeed, max: Self.maxProjectileSpeed)
+    }
+
+    func setProjectileFriction(_ friction: Float) {
+        currentProjectileFriction = clamp(friction, min: Self.minProjectileFriction, max: Self.maxProjectileFriction)
+    }
+
+    @MainActor
+    func setLinearDamping(_ damping: Float) {
+        currentLinearDamping = clamp(damping, min: Self.minLinearDamping, max: Self.maxLinearDamping)
+        applySimulationParameters()
+    }
+
+    @MainActor
+    func setAngularDamping(_ damping: Float) {
+        currentAngularDamping = clamp(damping, min: Self.minAngularDamping, max: Self.maxAngularDamping)
+        applySimulationParameters()
     }
 
     func setTorusVisualMode(_ mode: AVBDTorusVisualMode) {
@@ -754,6 +1256,27 @@ class Renderer: NSObject, MTKViewDelegate {
         )
     }
 
+    private func makeArmadilloInstance(
+        position: SIMD3<Float>,
+        orientation: simd_quatf,
+        targetSize: Float,
+        color: SIMD4<Float>
+    ) -> InstanceUniforms? {
+        guard let modelMatrix = armadilloModelMatrix(
+            position: position,
+            orientation: orientation,
+            targetSize: targetSize
+        ) else {
+            return nil
+        }
+
+        return InstanceUniforms(
+            modelMatrix: modelMatrix,
+            renderColor: color,
+            shapeParams: SIMD4<Float>(Float(AVBDRenderShape.box.rawValue), 0, 0, 0)
+        )
+    }
+
     @MainActor
     func orbitCamera(delta: CGPoint) {
         cameraAzimuth -= Float(delta.x) * orbitGestureSpeed
@@ -780,6 +1303,10 @@ class Renderer: NSObject, MTKViewDelegate {
         }
         solver = AVBDSolver(scene: scene)
         gpuSolver = AVBDGPUSolver(device: device, scene: scene)
+        rebuildSceneCollisionMeshes()
+        applyCollisionMeshesToGPUSolver(fullRebuild: true)
+        scheduleArmadilloCollisionResourcePreloadIfNeeded()
+        armadilloDynamicRenderProxies.removeAll()
         applySimulationParameters()
         gpuSolver?.broadphaseFullRefreshStepCount = sceneDefaults.broadphaseFullRefreshStepCount
         gpuSolver?.enableContactWarmstart = enableContactWarmstart
@@ -802,8 +1329,12 @@ class Renderer: NSObject, MTKViewDelegate {
     private func applySimulationParameters() {
         solver.dt = sceneDefaults.simulationStepDeltaTime
         solver.iterations = sceneDefaults.solverIterationCount
+        solver.linearDamping = currentLinearDamping
+        solver.angularDamping = currentAngularDamping
         gpuSolver?.dt = sceneDefaults.simulationStepDeltaTime
         gpuSolver?.iterations = sceneDefaults.solverIterationCount
+        gpuSolver?.linearDamping = currentLinearDamping
+        gpuSolver?.angularDamping = currentAngularDamping
     }
 
     @MainActor
@@ -917,8 +1448,9 @@ class Renderer: NSObject, MTKViewDelegate {
         let spawnPos = rayOrigin + rayDir * 2.0
         let throwVelocity = rayDir * currentProjectileSpeed
 
-        let projectileSize = projectileSizeVector(for: projectileRenderShape)
-        let projectileDensity = projectileDensity(for: projectileSize, shape: projectileRenderShape)
+        let projectilePhysicsShape = physicsRenderShape(for: currentProjectileKind)
+        let projectileSize = projectileSizeVector(for: currentProjectileKind)
+        let projectileDensity = projectileDensity(for: projectileSize, shape: projectilePhysicsShape)
         let colors: [SIMD4<Float>] = [
             SIMD4<Float>(1.0, 0.3, 0.2, 1.0),
             SIMD4<Float>(0.2, 0.8, 1.0, 1.0),
@@ -929,36 +1461,92 @@ class Renderer: NSObject, MTKViewDelegate {
         switch currentSolverMode {
         case .gpu:
             guard let gpuSolver else { return }
+            let existingBodyCount = gpuSolver.bodyCount
             let color = colors[gpuSolver.bodyCount % colors.count]
-            _ = gpuSolver.addBody(
+            let bodyIndex = gpuSolver.addBody(
                 position: spawnPos,
                 velocity: throwVelocity,
                 size: projectileSize,
                 density: projectileDensity,
-                friction: 0.5,
+                friction: currentProjectileFriction,
                 renderColor: color,
-                renderShape: projectileRenderShape
+                renderShape: projectilePhysicsShape
             )
+            if currentProjectileKind == .armadillo, let bodyIndex {
+                armadilloDynamicRenderProxies.append(ArmadilloRenderProxy(bodyIndex: bodyIndex, baseColor: color))
+            }
+            if let newBodyIndex = bodyIndex {
+                if currentProjectileKind == .armadillo {
+                    // Keep SAT enabled against static bodies such as the ground.
+                    gpuSolver.addIgnoredCollisionPairs(
+                        (0..<existingBodyCount)
+                            .filter { gpuSolver.isDynamicBody($0) }
+                            .map { (newBodyIndex, $0) }
+                    )
+                    appendDynamicArmadilloCollisionMesh(
+                        bodyIndex: newBodyIndex,
+                        position: spawnPos,
+                        orientation: simd_quatf(),
+                        size: projectileSize
+                    )
+                } else {
+                    gpuSolver.addIgnoredCollisionPairs(
+                        armadilloDynamicRenderProxies
+                            .filter { $0.bodyIndex != newBodyIndex }
+                            .map { (newBodyIndex, $0.bodyIndex) }
+                    )
+                }
+                if currentProjectileKind == .armadillo,
+                   let collisionMeshInstance = collisionMeshBroadphaseMeshes.last,
+                   gpuSolver.appendCollisionMeshInstance(collisionMeshInstance) {
+                    addCollisionMeshSDFResourcesToResidencySetIfNeeded()
+                } else {
+                    applyCollisionMeshesToGPUSolver(fullRebuild: true)
+                }
+            }
         case .cpu:
             let color = colors[solver.bodies.count % colors.count]
-            _ = solver.addBody(
+            let bodyIndex = solver.addBody(
                 position: spawnPos,
                 velocity: throwVelocity,
                 size: projectileSize,
                 density: projectileDensity,
-                friction: 0.5,
+                friction: currentProjectileFriction,
                 renderColor: color,
-                renderShape: projectileRenderShape
+                renderShape: projectilePhysicsShape
             )
+            if currentProjectileKind == .armadillo {
+                armadilloDynamicRenderProxies.append(ArmadilloRenderProxy(bodyIndex: bodyIndex, baseColor: color))
+            }
         }
     }
 
-    private func projectileSizeVector(for shape: AVBDRenderShape) -> SIMD3<Float> {
-        switch shape {
-        case .box, .sphere:
+    private func physicsRenderShape(for projectileKind: AVBDProjectileKind) -> AVBDRenderShape {
+        switch projectileKind {
+        case .box:
+            return .box
+        case .sphere, .armadillo:
+            return .sphere
+        case .torus:
+            return .torus
+        }
+    }
+
+    private func projectileSizeVector(for projectileKind: AVBDProjectileKind) -> SIMD3<Float> {
+        switch projectileKind {
+        case .box, .sphere, .armadillo:
             return SIMD3<Float>(repeating: currentProjectileSize)
         case .torus:
             return SIMD3<Float>(currentProjectileSize, currentProjectileSize, currentProjectileSize * 0.35)
+        }
+    }
+
+    private func projectileRenderSize(for bodySize: SIMD3<Float>, projectileKind: AVBDProjectileKind) -> Float {
+        switch projectileKind {
+        case .armadillo:
+            return max(bodySize.x, max(bodySize.y, bodySize.z))
+        case .box, .sphere, .torus:
+            return max(bodySize.x, max(bodySize.y, bodySize.z))
         }
     }
 
@@ -968,6 +1556,80 @@ class Renderer: NSObject, MTKViewDelegate {
         return currentProjectileMass / unitDensityMass
     }
 
+    private func filteredArmadilloRenderProxies(bodyCount: Int) -> [ArmadilloRenderProxy] {
+        armadilloDynamicRenderProxies = armadilloDynamicRenderProxies.filter { $0.bodyIndex < bodyCount }
+        return armadilloDynamicRenderProxies
+    }
+
+    private func projectileKind(for renderShape: AVBDRenderShape, bodyIndex: Int, armadilloBodyIndices: Set<Int>) -> AVBDProjectileKind {
+        if armadilloBodyIndices.contains(bodyIndex) {
+            return .armadillo
+        }
+
+        switch renderShape {
+        case .box, .sphere:
+            return renderShape == .box ? .box : .sphere
+        case .torus:
+            return .torus
+        }
+    }
+
+    private func appendSceneStaticRenderInstances(
+        armadilloInstances: UnsafeMutablePointer<InstanceUniforms>
+    ) {
+        guard let placement = sceneArmadilloPlacement(),
+              let armadilloInstance = makeArmadilloInstance(
+                position: placement.position,
+                orientation: placement.orientation,
+                targetSize: placement.targetSize,
+                color: placement.color
+              ) else {
+            return
+        }
+
+        armadilloInstances[armadilloInstanceCount] = armadilloInstance
+        armadilloInstanceCount += 1
+    }
+
+    private func appendCollisionMeshDebugBounds(
+        sdfDebugInstances: UnsafeMutablePointer<InstanceUniforms>
+    ) {
+        guard showCollisionMeshSDFBounds,
+              let gpuSolver else {
+            return
+        }
+
+        let meshInfos = gpuSolver.collisionMeshInfoSnapshot()
+        for meshIndex in meshInfos.indices {
+            let meshInfo = meshInfos[meshIndex]
+            let localMinBounds = SIMD3<Float>(
+                meshInfo.sdfLocalMinBounds.x,
+                meshInfo.sdfLocalMinBounds.y,
+                meshInfo.sdfLocalMinBounds.z
+            )
+            let localMaxBounds = SIMD3<Float>(
+                meshInfo.sdfLocalMaxBounds.x,
+                meshInfo.sdfLocalMaxBounds.y,
+                meshInfo.sdfLocalMaxBounds.z
+            )
+            let localCenter = 0.5 * (localMinBounds + localMaxBounds)
+            let localExtent = max(localMaxBounds - localMinBounds, SIMD3<Float>(repeating: 0.01))
+            let modelMatrix = simd_mul(
+                meshInfo.sdfTransform,
+                simd_mul(
+                    matrix4x4_translation(localCenter.x, localCenter.y, localCenter.z),
+                    matrix4x4_scale(localExtent.x, localExtent.y, localExtent.z)
+                )
+            )
+            sdfDebugInstances[sdfDebugInstanceCount] = InstanceUniforms(
+                modelMatrix: modelMatrix,
+                renderColor: SIMD4<Float>(0.18, 0.92, 1.0, 0.38),
+                shapeParams: SIMD4<Float>(Float(AVBDRenderShape.box.rawValue), Float(meshIndex), 0, 0)
+            )
+            sdfDebugInstanceCount += 1
+        }
+    }
+
     private func populateRenderInstances() {
         let boxInstances = UnsafeMutableRawPointer(instanceBuffer.contents() + instanceBufferOffset)
             .bindMemory(to: InstanceUniforms.self, capacity: maxInstanceCount)
@@ -975,67 +1637,147 @@ class Renderer: NSObject, MTKViewDelegate {
             .bindMemory(to: InstanceUniforms.self, capacity: maxInstanceCount)
         let torusInstances = UnsafeMutableRawPointer(torusInstanceBuffer.contents() + instanceBufferOffset)
             .bindMemory(to: InstanceUniforms.self, capacity: maxInstanceCount)
-
-        if currentSolverMode == .gpu, let gpuSolver = gpuSolver {
-            let counts = gpuSolver.writeRenderInstances(
-                boxInstances: boxInstances,
-                sphereInstances: sphereInstances,
-                torusInstances: torusInstances,
-                torusVisualMode: currentTorusVisualMode
-            )
-            boxInstanceCount = counts.boxCount
-            sphereInstanceCount = counts.sphereCount
-            torusInstanceCount = counts.torusCount
-            return
-        }
+        let armadilloInstances = UnsafeMutableRawPointer(armadilloInstanceBuffer.contents() + instanceBufferOffset)
+            .bindMemory(to: InstanceUniforms.self, capacity: maxInstanceCount)
+        let sdfDebugInstances = UnsafeMutableRawPointer(sdfDebugInstanceBuffer.contents() + instanceBufferOffset)
+            .bindMemory(to: InstanceUniforms.self, capacity: maxInstanceCount)
 
         boxInstanceCount = 0
         sphereInstanceCount = 0
         torusInstanceCount = 0
+        armadilloInstanceCount = 0
+        sdfDebugInstanceCount = 0
 
-        for body in solver.bodies {
-            switch body.renderShape {
-            case .box:
-                boxInstances[boxInstanceCount] = makeRigidInstance(
-                    position: body.positionLin,
-                    orientation: body.positionAng,
-                    size: body.size,
-                    color: body.color,
-                    shape: .box
+        var gpuBodies: [AVBDGPUBody] = []
+        let armadilloBodyIndices: Set<Int>
+        if currentSolverMode == .gpu, let gpuSolver {
+            gpuBodies = gpuSolver.readBodies()
+            armadilloBodyIndices = Set(filteredArmadilloRenderProxies(bodyCount: gpuBodies.count).map(\.bodyIndex))
+        } else {
+            armadilloBodyIndices = Set(filteredArmadilloRenderProxies(bodyCount: solver.bodies.count).map(\.bodyIndex))
+        }
+
+        if currentSolverMode == .gpu, let gpuSolver {
+            for bodyIndex in gpuBodies.indices {
+                let body = gpuBodies[bodyIndex]
+                let position = body.positionLin
+                let orientation = simd_quatf(vector: body.positionAng)
+                let color = gpuSolver.resolvedRenderColor(bodyIndex: bodyIndex)
+                let projectileKind = projectileKind(
+                    for: AVBDRenderShape(rawValue: Int(body.renderShape)) ?? .box,
+                    bodyIndex: bodyIndex,
+                    armadilloBodyIndices: armadilloBodyIndices
                 )
-                boxInstanceCount += 1
-            case .sphere:
-                sphereInstances[sphereInstanceCount] = makeRigidInstance(
-                    position: body.positionLin,
-                    orientation: body.positionAng,
+                appendRenderInstance(
+                    projectileKind: projectileKind,
+                    renderShape: AVBDRenderShape(rawValue: Int(body.renderShape)) ?? .box,
+                    position: position,
+                    orientation: orientation,
                     size: body.size,
-                    color: body.color,
-                    shape: .sphere
+                    color: color,
+                    boxInstances: boxInstances,
+                    sphereInstances: sphereInstances,
+                    torusInstances: torusInstances,
+                    armadilloInstances: armadilloInstances
                 )
-                sphereInstanceCount += 1
-            case .torus:
-                if currentTorusVisualMode == .solidTorus {
-                    torusInstances[torusInstanceCount] = makeTorusInstance(
-                        position: body.positionLin,
-                        orientation: body.positionAng,
-                        size: body.size,
-                        color: body.color
+            }
+            rebuildCollisionMeshes(dynamicBodies: gpuBodies)
+            applyCollisionMeshesToGPUSolver()
+            appendSceneStaticRenderInstances(armadilloInstances: armadilloInstances)
+            appendCollisionMeshDebugBounds(sdfDebugInstances: sdfDebugInstances)
+            return
+        }
+
+        for bodyIndex in solver.bodies.indices {
+            let body = solver.bodies[bodyIndex]
+            let projectileKind = projectileKind(
+                for: body.renderShape,
+                bodyIndex: bodyIndex,
+                armadilloBodyIndices: armadilloBodyIndices
+            )
+            appendRenderInstance(
+                projectileKind: projectileKind,
+                renderShape: body.renderShape,
+                position: body.positionLin,
+                orientation: body.positionAng,
+                size: body.size,
+                color: body.color,
+                boxInstances: boxInstances,
+                sphereInstances: sphereInstances,
+                torusInstances: torusInstances,
+                armadilloInstances: armadilloInstances
+            )
+        }
+        appendSceneStaticRenderInstances(armadilloInstances: armadilloInstances)
+        appendCollisionMeshDebugBounds(sdfDebugInstances: sdfDebugInstances)
+    }
+
+    private func appendRenderInstance(
+        projectileKind: AVBDProjectileKind,
+        renderShape: AVBDRenderShape,
+        position: SIMD3<Float>,
+        orientation: simd_quatf,
+        size: SIMD3<Float>,
+        color: SIMD4<Float>,
+        boxInstances: UnsafeMutablePointer<InstanceUniforms>,
+        sphereInstances: UnsafeMutablePointer<InstanceUniforms>,
+        torusInstances: UnsafeMutablePointer<InstanceUniforms>,
+        armadilloInstances: UnsafeMutablePointer<InstanceUniforms>
+    ) {
+        if projectileKind == .armadillo {
+            if let armadilloInstance = makeArmadilloInstance(
+                position: position,
+                orientation: orientation,
+                targetSize: projectileRenderSize(for: size, projectileKind: projectileKind),
+                color: color
+            ) {
+                armadilloInstances[armadilloInstanceCount] = armadilloInstance
+                armadilloInstanceCount += 1
+            }
+            return
+        }
+
+        switch renderShape {
+        case .box:
+            boxInstances[boxInstanceCount] = makeRigidInstance(
+                position: position,
+                orientation: orientation,
+                size: size,
+                color: color,
+                shape: .box
+            )
+            boxInstanceCount += 1
+        case .sphere:
+            sphereInstances[sphereInstanceCount] = makeRigidInstance(
+                position: position,
+                orientation: orientation,
+                size: size,
+                color: color,
+                shape: .sphere
+            )
+            sphereInstanceCount += 1
+        case .torus:
+            if currentTorusVisualMode == .solidTorus {
+                torusInstances[torusInstanceCount] = makeTorusInstance(
+                    position: position,
+                    orientation: orientation,
+                    size: size,
+                    color: color
+                )
+                torusInstanceCount += 1
+            } else {
+                let torusSphereCount = avbdCurrentTorusApproxSphereCount()
+                let sphereDiameter = avbdTorusApproxSphereRadius(size: size) * 2.0
+                for torusSphereIndex in 0..<torusSphereCount {
+                    let center = orientation.act(
+                        avbdTorusApproxSphereLocalCenter(size: size, index: torusSphereIndex)
+                    ) + position
+                    sphereInstances[sphereInstanceCount] = makeProxySphereInstance(
+                        center: center,
+                        diameter: sphereDiameter,
+                        color: color
                     )
-                    torusInstanceCount += 1
-                } else {
-                    let torusSphereCount = avbdCurrentTorusApproxSphereCount()
-                    let sphereDiameter = avbdTorusApproxSphereRadius(size: body.size) * 2.0
-                    for torusSphereIndex in 0..<torusSphereCount {
-                        let center = body.positionAng.act(
-                            avbdTorusApproxSphereLocalCenter(size: body.size, index: torusSphereIndex)
-                        ) + body.positionLin
-                        sphereInstances[sphereInstanceCount] = makeProxySphereInstance(
-                            center: center,
-                            diameter: sphereDiameter,
-                            color: body.color
-                        )
-                        sphereInstanceCount += 1
-                    }
+                    sphereInstanceCount += 1
                 }
             }
         }
@@ -1044,6 +1786,7 @@ class Renderer: NSObject, MTKViewDelegate {
     private func runSolverStep() {
         guard currentSolverMode == .gpu else {
             solver.step()
+            applyApproximateMeshCollisionsToCPUSolver()
             completedSimulationStepCount += 1
             populateRenderInstances()
             return
@@ -1054,6 +1797,7 @@ class Renderer: NSObject, MTKViewDelegate {
               let cmdBuf = computeQueue.makeCommandBuffer() else {
             currentSolverMode = .cpu
             solver.step()
+            applyApproximateMeshCollisionsToCPUSolver()
             completedSimulationStepCount += 1
             populateRenderInstances()
             return
@@ -1064,6 +1808,100 @@ class Renderer: NSObject, MTKViewDelegate {
         cmdBuf.waitUntilCompleted()
         completedSimulationStepCount += 1
         populateRenderInstances()
+    }
+
+    private func applyApproximateMeshCollisionsToCPUSolver() {
+        guard !collisionMeshBroadphaseMeshes.isEmpty else {
+            return
+        }
+
+        for body in solver.bodies where body.mass > 0 {
+            let radius = avbdShapeRadius(size: body.size, shape: body.renderShape)
+            var center = body.positionLin
+            var velocity = body.velocityLin
+
+            for mesh in collisionMeshBroadphaseMeshes {
+                let worldBounds = approximateWorldBounds(for: mesh)
+                let correction = sphereAABBCorrection(
+                    center: center,
+                    radius: radius,
+                    minBounds: worldBounds.min,
+                    maxBounds: worldBounds.max
+                )
+                guard let correction else {
+                    continue
+                }
+
+                center += correction.normal * correction.penetration
+                let inwardVelocity = simd_dot(velocity, correction.normal)
+                if inwardVelocity < 0 {
+                    velocity -= correction.normal * inwardVelocity
+                }
+            }
+
+            body.positionLin = center
+            body.velocityLin = velocity
+            body.prevVelocityLin = velocity
+        }
+    }
+
+    private func approximateWorldBounds(
+        for mesh: AVBDCollisionMeshBroadphaseMesh
+    ) -> (min: SIMD3<Float>, max: SIMD3<Float>) {
+        let minLocal = mesh.localBoundsMin
+        let maxLocal = mesh.localBoundsMax
+        let corners: [SIMD3<Float>] = [
+            SIMD3<Float>(minLocal.x, minLocal.y, minLocal.z),
+            SIMD3<Float>(maxLocal.x, minLocal.y, minLocal.z),
+            SIMD3<Float>(minLocal.x, maxLocal.y, minLocal.z),
+            SIMD3<Float>(maxLocal.x, maxLocal.y, minLocal.z),
+            SIMD3<Float>(minLocal.x, minLocal.y, maxLocal.z),
+            SIMD3<Float>(maxLocal.x, minLocal.y, maxLocal.z),
+            SIMD3<Float>(minLocal.x, maxLocal.y, maxLocal.z),
+            SIMD3<Float>(maxLocal.x, maxLocal.y, maxLocal.z),
+        ]
+
+        var worldMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var worldMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for corner in corners {
+            let transformed = mesh.transform * SIMD4<Float>(corner, 1)
+            let world = SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+            worldMin = simd_min(worldMin, world)
+            worldMax = simd_max(worldMax, world)
+        }
+        return (worldMin, worldMax)
+    }
+
+    private func sphereAABBCorrection(
+        center: SIMD3<Float>,
+        radius: Float,
+        minBounds: SIMD3<Float>,
+        maxBounds: SIMD3<Float>
+    ) -> (normal: SIMD3<Float>, penetration: Float)? {
+        let closest = simd_clamp(center, minBounds, maxBounds)
+        let delta = center - closest
+        let distanceSquared = simd_length_squared(delta)
+
+        if distanceSquared > 1.0e-8 {
+            let distance = sqrt(distanceSquared)
+            guard distance < radius else { return nil }
+            return (delta / distance, radius - distance + 0.001)
+        }
+
+        let distancesToFaces = [
+            (center.x - minBounds.x, SIMD3<Float>(1, 0, 0)),
+            (maxBounds.x - center.x, SIMD3<Float>(-1, 0, 0)),
+            (center.y - minBounds.y, SIMD3<Float>(0, 1, 0)),
+            (maxBounds.y - center.y, SIMD3<Float>(0, -1, 0)),
+            (center.z - minBounds.z, SIMD3<Float>(0, 0, 1)),
+            (maxBounds.z - center.z, SIMD3<Float>(0, 0, -1)),
+        ]
+
+        guard let nearestFace = distancesToFaces.min(by: { $0.0 < $1.0 }) else {
+            return nil
+        }
+
+        return (nearestFace.1, radius + nearestFace.0 + 0.001)
     }
 
     private func bindMesh(_ mesh: MTKMesh, instanceBuffer: MTLBuffer) {
@@ -1171,6 +2009,26 @@ class Renderer: NSObject, MTKViewDelegate {
         drawMesh(sphereMesh, instanceCount: sphereInstanceCount, encoder: renderEncoder)
         bindMesh(torusMesh, instanceBuffer: torusInstanceBuffer)
         drawMesh(torusMesh, instanceCount: torusInstanceCount, encoder: renderEncoder)
+        if let armadilloMesh {
+            bindMesh(armadilloMesh, instanceBuffer: armadilloInstanceBuffer)
+            drawMesh(armadilloMesh, instanceCount: armadilloInstanceCount, encoder: renderEncoder)
+        }
+
+        if showCollisionMeshSDFBounds,
+           sdfDebugInstanceCount > 0,
+           let gpuSolver,
+           let collisionMeshInfoBuffer = gpuSolver.collisionMeshDebugInfoBuffer,
+           let collisionMeshSDFArgumentBuffer = gpuSolver.collisionMeshDebugSDFArgumentBuffer {
+            renderEncoder.setRenderPipelineState(sdfDebugPipelineState)
+            renderEncoder.setDepthStencilState(debugDepthState)
+            renderEncoder.setArgumentTable(self.fragmentArgumentTable, stages: .fragment)
+            fragmentArgumentTable.setAddress(dynamicUniformBuffer.gpuAddress + UInt64(uniformBufferOffset), index: 0)
+            fragmentArgumentTable.setAddress(collisionMeshInfoBuffer.gpuAddress, index: 1)
+            fragmentArgumentTable.setAddress(collisionMeshSDFArgumentBuffer.gpuAddress, index: 2)
+            bindMesh(boxMesh, instanceBuffer: sdfDebugInstanceBuffer)
+            drawMesh(boxMesh, instanceCount: sdfDebugInstanceCount, encoder: renderEncoder)
+            renderEncoder.setDepthStencilState(depthState)
+        }
 
         renderEncoder.popDebugGroup()
 

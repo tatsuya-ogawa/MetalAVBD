@@ -49,8 +49,14 @@ This project is optimized for modern Apple Silicon and **Metal 4** features:
   - **Box (SAT)**: Accurate face/edge/vertex collision.
   - **Sphere**: Analytical geometry checks.
   - **Torus**: Advanced collision manifold generation via approximate sphere decomposition.
+  - **SDF (Signed Distance Field)**: High-performance collision against complex mesh geometry using pre-generated 3D volumes.
+- **SDF Visualization**: Real-time raymarching visualizer for debugging and inspecting SDF volume alignment and quality.
 
 ---
+
+## 🚧 Limitations
+
+- **SDF-to-SDF Collision**: Currently, collision detection between two SDF-based objects is not implemented. Only Primitive-to-SDF collisions are supported.
 
 ## 📱 Requirements
 
