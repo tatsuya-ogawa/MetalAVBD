@@ -28,7 +28,15 @@ private let gpuNilRenderColor = SIMD4<Float>(0, 0, 0, -1)
 private let gpuNilColorGroup: Int32 = Int32.min
 private let gpuCollisionMeshSDFLongestAxisResolution: Int32 = 64
 private let gpuCollisionMeshSDFTriangleChunkSize = 1024
+private let gpuCollisionMeshSDFBrickDim = 8
+private let gpuCollisionMeshSDFGuardVoxelCount = 1
+private let gpuCollisionMeshSDFStoredBrickDim = gpuCollisionMeshSDFBrickDim + gpuCollisionMeshSDFGuardVoxelCount * 2
+private let gpuCollisionMeshSDFAtlasBricksAcross = 64
+private let gpuCollisionMeshSDFCoarseDownsampleFactor = 2
+private let gpuCollisionMeshSDFMappedBrickDilation = 1
 private let gpuMaxCollisionMeshSDFs = Int(AVBD_MAX_COLLISION_MESH_SDFS)
+private let gpuCollisionMeshSDFAtlasTextureBaseIndex = gpuMaxCollisionMeshSDFs
+private let gpuCollisionMeshSDFIndirectionTextureBaseIndex = gpuMaxCollisionMeshSDFs * 2
 
 private struct AVBDGPUOBB {
     var center: SIMD3<Float>
@@ -66,8 +74,29 @@ struct AVBDCollisionMeshBroadphaseMesh {
 }
 
 final class AVBDGPUSolver {
+    private struct CollisionMeshSDFResource {
+        var coarseTexture: MTLTexture
+        var atlasTexture: MTLTexture
+        var indirectionTexture: MTLTexture
+        var mappedBrickCount: Int
+        var denseByteCount: Int
+        var compactedByteCount: Int
+    }
+
+    struct CollisionMeshSDFCompactionData {
+        var coarseResolution: SIMD3<Int>
+        var atlasResolution: SIMD3<Int>
+        var brickGrid: SIMD3<Int>
+        var coarseData: [Float]
+        var atlasData: [Float]
+        var indirectionData: [UInt32]
+        var mappedBrickCount: Int
+        var denseByteCount: Int
+        var compactedByteCount: Int
+    }
+
     private struct CachedCollisionMeshSDF {
-        var texture: MTLTexture
+        var resource: CollisionMeshSDFResource
     }
 
     private struct CollisionMeshGeometryResource {
@@ -84,7 +113,7 @@ final class AVBDGPUSolver {
     private let collisionMeshSDFCommandQueue: MTLCommandQueue?
     private let collisionMeshSDFArgumentEncoder: MTLArgumentEncoder?
     private var collisionMeshSDFArgumentBuffer: MTLBuffer?
-    private var collisionMeshSDFTextures: [MTLTexture] = []
+    private var collisionMeshSDFResources: [CollisionMeshSDFResource] = []
     private var collisionMeshGeometryResources: [String: CollisionMeshGeometryResource] = [:]
     private var collisionMeshSDFResourceIndicesByKey: [String: Int] = [:]
     private var collisionMeshVertexCountUsed = 0
@@ -266,14 +295,16 @@ final class AVBDGPUSolver {
 
     var collisionMeshDebugSDFArgumentBuffer: MTLBuffer? {
         guard collisionMeshCount > 0,
-              !collisionMeshSDFTextures.isEmpty else {
+              !collisionMeshSDFResources.isEmpty else {
             return nil
         }
         return collisionMeshSDFArgumentBuffer
     }
 
     var collisionMeshDebugTextures: [MTLTexture] {
-        Array(collisionMeshSDFTextures.prefix(collisionMeshCount))
+        collisionMeshSDFResources
+            .prefix(collisionMeshCount)
+            .flatMap { [$0.coarseTexture, $0.atlasTexture, $0.indirectionTexture] }
     }
 
     func collisionMeshInfoSnapshot() -> [AVBDGPUCollisionMeshInfo] {
@@ -310,7 +341,7 @@ final class AVBDGPUSolver {
     }
 
     private func updateCollisionMeshSDFArgumentBufferBindings() {
-        guard let collisionMeshSDFArgumentEncoder, !collisionMeshSDFTextures.isEmpty else {
+        guard let collisionMeshSDFArgumentEncoder, !collisionMeshSDFResources.isEmpty else {
             return
         }
         if collisionMeshSDFArgumentBuffer == nil
@@ -323,8 +354,16 @@ final class AVBDGPUSolver {
         if let collisionMeshSDFArgumentBuffer {
             collisionMeshSDFArgumentEncoder.setArgumentBuffer(collisionMeshSDFArgumentBuffer, offset: 0)
             for textureIndex in 0..<gpuMaxCollisionMeshSDFs {
-                let texture = textureIndex < collisionMeshSDFTextures.count ? collisionMeshSDFTextures[textureIndex] : nil
-                collisionMeshSDFArgumentEncoder.setTexture(texture, index: textureIndex)
+                let resource = textureIndex < collisionMeshSDFResources.count ? collisionMeshSDFResources[textureIndex] : nil
+                collisionMeshSDFArgumentEncoder.setTexture(resource?.coarseTexture, index: textureIndex)
+                collisionMeshSDFArgumentEncoder.setTexture(
+                    resource?.atlasTexture,
+                    index: gpuCollisionMeshSDFAtlasTextureBaseIndex + textureIndex
+                )
+                collisionMeshSDFArgumentEncoder.setTexture(
+                    resource?.indirectionTexture,
+                    index: gpuCollisionMeshSDFIndirectionTextureBaseIndex + textureIndex
+                )
             }
         }
     }
@@ -335,9 +374,9 @@ final class AVBDGPUSolver {
         return collisionMeshSDFCache[key]
     }
 
-    private static func storeCollisionMeshSDF(_ texture: MTLTexture, for key: String) {
+    private static func storeCollisionMeshSDF(_ resource: CollisionMeshSDFResource, for key: String) {
         collisionMeshSDFCacheLock.lock()
-        collisionMeshSDFCache[key] = CachedCollisionMeshSDF(texture: texture)
+        collisionMeshSDFCache[key] = CachedCollisionMeshSDF(resource: resource)
         collisionMeshSDFCacheLock.unlock()
     }
 
@@ -361,7 +400,7 @@ final class AVBDGPUSolver {
             return true
         }
 
-        guard let sdfTexture = buildCollisionMeshSDFTexture(
+        guard let sdfResource = buildCollisionMeshSDFTexture(
             localVertices: mesh.positions,
             indices: mesh.indices,
             localBoundsMin: sdfLocalMinBounds,
@@ -371,7 +410,7 @@ final class AVBDGPUSolver {
             return false
         }
 
-        Self.storeCollisionMeshSDF(sdfTexture, for: resourceKey)
+        Self.storeCollisionMeshSDF(sdfResource, for: resourceKey)
         return true
     }
 
@@ -429,28 +468,28 @@ final class AVBDGPUSolver {
         }
 
         if collisionMeshSDFResourceIndicesByKey[resourceKey] == nil {
-            let sdfTexture: MTLTexture?
+            let sdfResource: CollisionMeshSDFResource?
             if let cached = Self.cachedCollisionMeshSDF(for: resourceKey) {
-                sdfTexture = cached.texture
+                sdfResource = cached.resource
             } else {
-                sdfTexture = buildCollisionMeshSDFTexture(
+                sdfResource = buildCollisionMeshSDFTexture(
                     localVertices: mesh.positions,
                     indices: mesh.indices,
                     localBoundsMin: sdfLocalMinBounds,
                     localBoundsMax: sdfLocalMaxBounds,
                     resolution: sdfResolution
                 )
-                if let sdfTexture {
-                    Self.storeCollisionMeshSDF(sdfTexture, for: resourceKey)
+                if let sdfResource {
+                    Self.storeCollisionMeshSDF(sdfResource, for: resourceKey)
                 }
             }
 
-            guard let sdfTexture else {
+            guard let sdfResource else {
                 return false
             }
 
-            collisionMeshSDFResourceIndicesByKey[resourceKey] = collisionMeshSDFTextures.count
-            collisionMeshSDFTextures.append(sdfTexture)
+            collisionMeshSDFResourceIndicesByKey[resourceKey] = collisionMeshSDFResources.count
+            collisionMeshSDFResources.append(sdfResource)
             updateCollisionMeshSDFArgumentBufferBindings()
         }
 
@@ -501,7 +540,7 @@ final class AVBDGPUSolver {
         }
 
         forceFullBroadphase = true
-        collisionMeshSDFStatusText = !collisionMeshSDFTextures.isEmpty ? "Cached" : "Idle"
+        collisionMeshSDFStatusText = !collisionMeshSDFResources.isEmpty ? "Cached" : "Idle"
         return true
     }
 
@@ -1215,7 +1254,7 @@ final class AVBDGPUSolver {
             )
 
             let usePrimitiveMeshSDF = collisionMeshSDFArgumentBuffer != nil
-                && !collisionMeshSDFTextures.isEmpty
+                && !collisionMeshSDFResources.isEmpty
             encoder.setComputePipelineState(
                 usePrimitiveMeshSDF
                     ? collidePrimitiveMeshSDFPSO
@@ -1236,8 +1275,10 @@ final class AVBDGPUSolver {
             if usePrimitiveMeshSDF,
                let collisionMeshSDFArgumentBuffer {
                 encoder.setBuffer(collisionMeshSDFArgumentBuffer, offset: 0, index: 12)
-                for texture in collisionMeshSDFTextures {
-                    encoder.useResource(texture, usage: .read)
+                for resource in collisionMeshSDFResources {
+                    encoder.useResource(resource.coarseTexture, usage: .read)
+                    encoder.useResource(resource.atlasTexture, usage: .read)
+                    encoder.useResource(resource.indirectionTexture, usage: .read)
                 }
             }
             encoder.dispatchThreadgroups(
@@ -1694,22 +1735,24 @@ final class AVBDGPUSolver {
         let clampedMeshes = Array(meshes.prefix(min(collisionMeshCapacity, gpuMaxCollisionMeshSDFs)))
         collisionMeshCount = clampedMeshes.count
         ensureCollisionCapacity(forMeshCount: collisionMeshCount)
-        collisionMeshSDFTextures.removeAll(keepingCapacity: true)
+        collisionMeshSDFResources.removeAll(keepingCapacity: true)
         collisionMeshSDFStatusText = collisionMeshCount > 0 ? "Building..." : "Idle"
 
         var meshInfos = Array(repeating: AVBDGPUCollisionMeshInfo(), count: max(collisionMeshCapacity, 1))
         var meshVertices: [SIMD3<Float>] = []
         var meshIndices: [UInt32] = []
-        var collisionMeshSDFTextures: [MTLTexture] = []
+        var collisionMeshSDFResources: [CollisionMeshSDFResource] = []
         var sdfResourceIndexByKey: [String: Int] = [:]
         var geometryResourceByKey: [String: CollisionMeshGeometryResource] = [:]
         var cacheHitCount = 0
         var uniqueSDFBuildCount = 0
+        var totalDenseSDFBytes = 0
+        var totalCompactedSDFBytes = 0
         let buildStartTime = CACurrentMediaTime()
 
         meshVertices.reserveCapacity(clampedMeshes.reduce(0) { $0 + $1.positions.count })
         meshIndices.reserveCapacity(clampedMeshes.reduce(0) { $0 + $1.indices.count })
-        collisionMeshSDFTextures.reserveCapacity(collisionMeshCount)
+        collisionMeshSDFResources.reserveCapacity(collisionMeshCount)
 
         for meshIndex in 0..<collisionMeshCount {
             let mesh = clampedMeshes[meshIndex]
@@ -1758,32 +1801,34 @@ final class AVBDGPUSolver {
             if let existingResourceIndex = sdfResourceIndexByKey[sdfCacheKey] {
                 sdfResourceIndex = existingResourceIndex
             } else {
-                let sdfTexture: MTLTexture?
+                let sdfResource: CollisionMeshSDFResource?
                 if let cached = Self.cachedCollisionMeshSDF(for: sdfCacheKey) {
-                    sdfTexture = cached.texture
+                    sdfResource = cached.resource
                     cacheHitCount += 1
                 } else {
-                    sdfTexture = buildCollisionMeshSDFTexture(
+                    sdfResource = buildCollisionMeshSDFTexture(
                         localVertices: mesh.positions,
                         indices: mesh.indices,
                         localBoundsMin: sdfLocalMinBounds,
                         localBoundsMax: sdfLocalMaxBounds,
                         resolution: sdfResolution
                     )
-                    if let sdfTexture {
-                        Self.storeCollisionMeshSDF(sdfTexture, for: sdfCacheKey)
+                    if let sdfResource {
+                        Self.storeCollisionMeshSDF(sdfResource, for: sdfCacheKey)
                     }
                 }
 
-                guard let sdfTexture else {
+                guard let sdfResource else {
                     print("Failed to build collision mesh SDF texture for mesh \(meshIndex)")
-                    collisionMeshSDFTextures.removeAll(keepingCapacity: true)
+                    collisionMeshSDFResources.removeAll(keepingCapacity: true)
                     break
                 }
 
-                sdfResourceIndex = collisionMeshSDFTextures.count
+                sdfResourceIndex = collisionMeshSDFResources.count
                 sdfResourceIndexByKey[sdfCacheKey] = sdfResourceIndex
-                collisionMeshSDFTextures.append(sdfTexture)
+                collisionMeshSDFResources.append(sdfResource)
+                totalDenseSDFBytes += sdfResource.denseByteCount
+                totalCompactedSDFBytes += sdfResource.compactedByteCount
                 uniqueSDFBuildCount += 1
             }
 
@@ -1849,19 +1894,36 @@ final class AVBDGPUSolver {
             }
         }
 
-        self.collisionMeshSDFTextures = collisionMeshSDFTextures
+        self.collisionMeshSDFResources = collisionMeshSDFResources
         updateCollisionMeshSDFArgumentBufferBindings()
 
         let buildDurationMS = (CACurrentMediaTime() - buildStartTime) * 1000.0
         if collisionMeshCount == 0 {
             collisionMeshSDFStatusText = "Idle"
-        } else if !collisionMeshSDFTextures.isEmpty {
-            if uniqueSDFBuildCount == cacheHitCount && uniqueSDFBuildCount > 0 {
-                collisionMeshSDFStatusText = String(format: "Cached %.1f ms", buildDurationMS)
-            } else if cacheHitCount > 0 {
-                collisionMeshSDFStatusText = String(format: "Built %d/%d %.1f ms", uniqueSDFBuildCount - cacheHitCount, uniqueSDFBuildCount, buildDurationMS)
+        } else if !collisionMeshSDFResources.isEmpty {
+            let compactPercent: Int
+            if totalDenseSDFBytes > 0 {
+                compactPercent = Int((Double(totalCompactedSDFBytes) / Double(totalDenseSDFBytes) * 100.0).rounded())
             } else {
-                collisionMeshSDFStatusText = String(format: "Built %d %.1f ms", uniqueSDFBuildCount, buildDurationMS)
+                compactPercent = 100
+            }
+            if uniqueSDFBuildCount == cacheHitCount && uniqueSDFBuildCount > 0 {
+                collisionMeshSDFStatusText = String(format: "Cached %.1f ms %d%%", buildDurationMS, compactPercent)
+            } else if cacheHitCount > 0 {
+                collisionMeshSDFStatusText = String(
+                    format: "Built %d/%d %.1f ms %d%%",
+                    uniqueSDFBuildCount - cacheHitCount,
+                    uniqueSDFBuildCount,
+                    buildDurationMS,
+                    compactPercent
+                )
+            } else {
+                collisionMeshSDFStatusText = String(
+                    format: "Built %d %.1f ms %d%%",
+                    uniqueSDFBuildCount,
+                    buildDurationMS,
+                    compactPercent
+                )
             }
         } else {
             collisionMeshSDFStatusText = "Build Failed"
@@ -1876,7 +1938,31 @@ final class AVBDGPUSolver {
         localBoundsMin: SIMD3<Float>,
         localBoundsMax: SIMD3<Float>,
         resolution: SIMD3<Int32>
-    ) -> MTLTexture? {
+    ) -> CollisionMeshSDFResource? {
+        guard let denseBuild = buildDenseCollisionMeshSDFTexture(
+            localVertices: localVertices,
+            indices: indices,
+            localBoundsMin: localBoundsMin,
+            localBoundsMax: localBoundsMax,
+            resolution: resolution
+        ) else {
+            return nil
+        }
+
+        return compactCollisionMeshSDFTexture(
+            denseTexture: denseBuild.texture,
+            resolution: resolution,
+            voxelSize: denseBuild.voxelSize
+        )
+    }
+
+    func buildDenseCollisionMeshSDFTexture(
+        localVertices: [SIMD3<Float>],
+        indices: [UInt32],
+        localBoundsMin: SIMD3<Float>,
+        localBoundsMax: SIMD3<Float>,
+        resolution: SIMD3<Int32>
+    ) -> (texture: MTLTexture, voxelSize: SIMD3<Float>)? {
         guard let collisionMeshSDFCommandQueue,
               !localVertices.isEmpty,
               indices.count >= 3,
@@ -1911,10 +1997,10 @@ final class AVBDGPUSolver {
         textureDescriptor.width = Int(resolution.x)
         textureDescriptor.height = Int(resolution.y)
         textureDescriptor.depth = Int(resolution.z)
-        textureDescriptor.storageMode = .private
+        textureDescriptor.storageMode = .shared
         textureDescriptor.usage = [.shaderRead, .shaderWrite]
 
-        guard let texture = device.makeTexture(descriptor: textureDescriptor),
+        guard let denseTexture = device.makeTexture(descriptor: textureDescriptor),
               let commandBuffer = collisionMeshSDFCommandQueue.makeCommandBuffer() else {
             return nil
         }
@@ -1933,7 +2019,7 @@ final class AVBDGPUSolver {
 
         if let initializeEncoder = commandBuffer.makeComputeCommandEncoder() {
             initializeEncoder.setComputePipelineState(initializeCollisionMeshSDFPSO)
-            initializeEncoder.setTexture(texture, index: 0)
+            initializeEncoder.setTexture(denseTexture, index: 0)
             initializeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             initializeEncoder.endEncoding()
         } else {
@@ -1956,7 +2042,7 @@ final class AVBDGPUSolver {
             accumulateEncoder.setComputePipelineState(accumulateCollisionMeshSDFPSO)
             accumulateEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
             accumulateEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
-            accumulateEncoder.setTexture(texture, index: 0)
+            accumulateEncoder.setTexture(denseTexture, index: 0)
             accumulateEncoder.setBuffer(insideCountBuffer, offset: 0, index: 2)
             accumulateEncoder.setBytes(&triangleOffsetValue, length: MemoryLayout<UInt32>.stride, index: 3)
             accumulateEncoder.setBytes(&triangleChunkCountValue, length: MemoryLayout<UInt32>.stride, index: 4)
@@ -1970,7 +2056,7 @@ final class AVBDGPUSolver {
 
         if let finalizeEncoder = commandBuffer.makeComputeCommandEncoder() {
             finalizeEncoder.setComputePipelineState(finalizeCollisionMeshSDFPSO)
-            finalizeEncoder.setTexture(texture, index: 0)
+            finalizeEncoder.setTexture(denseTexture, index: 0)
             finalizeEncoder.setBuffer(insideCountBuffer, offset: 0, index: 0)
             finalizeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
             finalizeEncoder.endEncoding()
@@ -1985,15 +2071,361 @@ final class AVBDGPUSolver {
             return nil
         }
 
-        return texture
+        return (denseTexture, voxelSize)
     }
 
-    private static func collisionMeshSDFPadding(for mesh: AVBDCollisionMeshBroadphaseMesh) -> SIMD3<Float> {
+    private func compactCollisionMeshSDFTexture(
+        denseTexture: MTLTexture,
+        resolution: SIMD3<Int32>,
+        voxelSize: SIMD3<Float>
+    ) -> CollisionMeshSDFResource? {
+        let denseResolution = SIMD3<Int>(Int(resolution.x), Int(resolution.y), Int(resolution.z))
+        let denseVoxelCount = denseResolution.x * denseResolution.y * denseResolution.z
+        guard denseVoxelCount > 0 else {
+            return nil
+        }
+
+        var denseData = [Float](repeating: 0, count: denseVoxelCount)
+        denseData.withUnsafeMutableBytes { rawBuffer in
+            denseTexture.getBytes(
+                rawBuffer.baseAddress!,
+                bytesPerRow: denseResolution.x * MemoryLayout<Float>.stride,
+                bytesPerImage: denseResolution.x * denseResolution.y * MemoryLayout<Float>.stride,
+                from: MTLRegionMake3D(0, 0, 0, denseResolution.x, denseResolution.y, denseResolution.z),
+                mipmapLevel: 0,
+                slice: 0
+            )
+        }
+
+        guard let compactionData = Self.makeCollisionMeshSDFCompactionData(
+            denseData: denseData,
+            denseResolution: denseResolution,
+            voxelSize: voxelSize
+        ) else {
+            return nil
+        }
+
+        guard let coarseTexture = Self.makeCollisionMeshSDFTexture(
+                device: device,
+                resolution: compactionData.coarseResolution,
+                pixelFormat: .r32Float
+              ),
+              let atlasTexture = Self.makeCollisionMeshSDFTexture(
+                device: device,
+                resolution: compactionData.atlasResolution,
+                pixelFormat: .r32Float
+              ),
+              let indirectionTexture = Self.makeCollisionMeshSDFTexture(
+                device: device,
+                resolution: compactionData.brickGrid,
+                pixelFormat: .r32Uint
+              ) else {
+            return nil
+        }
+
+        compactionData.coarseData.withUnsafeBytes { rawBuffer in
+            coarseTexture.replace(
+                region: MTLRegionMake3D(0, 0, 0, compactionData.coarseResolution.x, compactionData.coarseResolution.y, compactionData.coarseResolution.z),
+                mipmapLevel: 0,
+                slice: 0,
+                withBytes: rawBuffer.baseAddress!,
+                bytesPerRow: compactionData.coarseResolution.x * MemoryLayout<Float>.stride,
+                bytesPerImage: compactionData.coarseResolution.x * compactionData.coarseResolution.y * MemoryLayout<Float>.stride
+            )
+        }
+        compactionData.atlasData.withUnsafeBytes { rawBuffer in
+            atlasTexture.replace(
+                region: MTLRegionMake3D(0, 0, 0, compactionData.atlasResolution.x, compactionData.atlasResolution.y, compactionData.atlasResolution.z),
+                mipmapLevel: 0,
+                slice: 0,
+                withBytes: rawBuffer.baseAddress!,
+                bytesPerRow: compactionData.atlasResolution.x * MemoryLayout<Float>.stride,
+                bytesPerImage: compactionData.atlasResolution.x * compactionData.atlasResolution.y * MemoryLayout<Float>.stride
+            )
+        }
+        compactionData.indirectionData.withUnsafeBytes { rawBuffer in
+            indirectionTexture.replace(
+                region: MTLRegionMake3D(0, 0, 0, compactionData.brickGrid.x, compactionData.brickGrid.y, compactionData.brickGrid.z),
+                mipmapLevel: 0,
+                slice: 0,
+                withBytes: rawBuffer.baseAddress!,
+                bytesPerRow: compactionData.brickGrid.x * MemoryLayout<UInt32>.stride,
+                bytesPerImage: compactionData.brickGrid.x * compactionData.brickGrid.y * MemoryLayout<UInt32>.stride
+            )
+        }
+
+        return CollisionMeshSDFResource(
+            coarseTexture: coarseTexture,
+            atlasTexture: atlasTexture,
+            indirectionTexture: indirectionTexture,
+            mappedBrickCount: compactionData.mappedBrickCount,
+            denseByteCount: compactionData.denseByteCount,
+            compactedByteCount: compactionData.compactedByteCount
+        )
+    }
+
+    private static func makeCollisionMeshSDFTexture(
+        device: MTLDevice,
+        resolution: SIMD3<Int>,
+        pixelFormat: MTLPixelFormat
+    ) -> MTLTexture? {
+        let descriptor = MTLTextureDescriptor()
+        descriptor.textureType = .type3D
+        descriptor.pixelFormat = pixelFormat
+        descriptor.width = resolution.x
+        descriptor.height = resolution.y
+        descriptor.depth = resolution.z
+        descriptor.storageMode = .shared
+        descriptor.usage = .shaderRead
+        return device.makeTexture(descriptor: descriptor)
+    }
+
+    static func makeCollisionMeshSDFCompactionData(
+        denseData: [Float],
+        denseResolution: SIMD3<Int>,
+        voxelSize: SIMD3<Float>
+    ) -> CollisionMeshSDFCompactionData? {
+        let brickGrid = collisionMeshSDFBrickGrid(resolution: denseResolution)
+        let keepHalfWidth = collisionMeshSDFSparseBandHalfWidth(voxelSize: voxelSize)
+        let brickCount = brickGrid.x * brickGrid.y * brickGrid.z
+        var keepMask = [Bool](repeating: false, count: brickCount)
+
+        var fallbackBrick = SIMD3<Int>(repeating: 0)
+        var fallbackBrickDistance = Float.greatestFiniteMagnitude
+
+        for brickZ in 0..<brickGrid.z {
+            for brickY in 0..<brickGrid.y {
+                for brickX in 0..<brickGrid.x {
+                    let brick = SIMD3<Int>(brickX, brickY, brickZ)
+                    let startX = brickX * gpuCollisionMeshSDFBrickDim
+                    let startY = brickY * gpuCollisionMeshSDFBrickDim
+                    let startZ = brickZ * gpuCollisionMeshSDFBrickDim
+                    let endX = min(startX + gpuCollisionMeshSDFBrickDim, denseResolution.x)
+                    let endY = min(startY + gpuCollisionMeshSDFBrickDim, denseResolution.y)
+                    let endZ = min(startZ + gpuCollisionMeshSDFBrickDim, denseResolution.z)
+
+                    var brickClosestDistance = Float.greatestFiniteMagnitude
+                    for z in startZ..<endZ {
+                        for y in startY..<endY {
+                            for x in startX..<endX {
+                                let value = denseData[collisionMeshSDFLinearIndex(x: x, y: y, z: z, resolution: denseResolution)]
+                                brickClosestDistance = min(brickClosestDistance, abs(value))
+                            }
+                        }
+                    }
+
+                    if brickClosestDistance < fallbackBrickDistance {
+                        fallbackBrickDistance = brickClosestDistance
+                        fallbackBrick = brick
+                    }
+
+                    if brickClosestDistance <= keepHalfWidth {
+                        keepMask[collisionMeshSDFLinearIndex(x: brick.x, y: brick.y, z: brick.z, resolution: brickGrid)] = true
+                    }
+                }
+            }
+        }
+
+        if !keepMask.contains(true) {
+            keepMask[collisionMeshSDFLinearIndex(x: fallbackBrick.x, y: fallbackBrick.y, z: fallbackBrick.z, resolution: brickGrid)] = true
+        }
+
+        if gpuCollisionMeshSDFMappedBrickDilation > 0 {
+            var dilatedMask = keepMask
+            for brickZ in 0..<brickGrid.z {
+                for brickY in 0..<brickGrid.y {
+                    for brickX in 0..<brickGrid.x {
+                        let brickIndex = collisionMeshSDFLinearIndex(x: brickX, y: brickY, z: brickZ, resolution: brickGrid)
+                        guard keepMask[brickIndex] else { continue }
+                        for neighborZ in max(0, brickZ - gpuCollisionMeshSDFMappedBrickDilation)...min(brickGrid.z - 1, brickZ + gpuCollisionMeshSDFMappedBrickDilation) {
+                            for neighborY in max(0, brickY - gpuCollisionMeshSDFMappedBrickDilation)...min(brickGrid.y - 1, brickY + gpuCollisionMeshSDFMappedBrickDilation) {
+                                for neighborX in max(0, brickX - gpuCollisionMeshSDFMappedBrickDilation)...min(brickGrid.x - 1, brickX + gpuCollisionMeshSDFMappedBrickDilation) {
+                                    dilatedMask[collisionMeshSDFLinearIndex(x: neighborX, y: neighborY, z: neighborZ, resolution: brickGrid)] = true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            keepMask = dilatedMask
+        }
+
+        var mappedBricks: [SIMD3<Int>] = []
+        mappedBricks.reserveCapacity(brickCount)
+        for brickZ in 0..<brickGrid.z {
+            for brickY in 0..<brickGrid.y {
+                for brickX in 0..<brickGrid.x {
+                    if keepMask[collisionMeshSDFLinearIndex(x: brickX, y: brickY, z: brickZ, resolution: brickGrid)] {
+                        mappedBricks.append(SIMD3<Int>(brickX, brickY, brickZ))
+                    }
+                }
+            }
+        }
+
+        let atlasBricks = SIMD3<Int>(
+            gpuCollisionMeshSDFAtlasBricksAcross,
+            gpuCollisionMeshSDFAtlasBricksAcross,
+            max(1, (mappedBricks.count + gpuCollisionMeshSDFAtlasBricksAcross * gpuCollisionMeshSDFAtlasBricksAcross - 1)
+                / (gpuCollisionMeshSDFAtlasBricksAcross * gpuCollisionMeshSDFAtlasBricksAcross))
+        )
+        let atlasResolution = SIMD3<Int>(
+            atlasBricks.x * gpuCollisionMeshSDFStoredBrickDim,
+            atlasBricks.y * gpuCollisionMeshSDFStoredBrickDim,
+            atlasBricks.z * gpuCollisionMeshSDFStoredBrickDim
+        )
+        let coarseResolution = SIMD3<Int>(
+            min(denseResolution.x, max(12, (denseResolution.x + gpuCollisionMeshSDFCoarseDownsampleFactor - 1) / gpuCollisionMeshSDFCoarseDownsampleFactor)),
+            min(denseResolution.y, max(12, (denseResolution.y + gpuCollisionMeshSDFCoarseDownsampleFactor - 1) / gpuCollisionMeshSDFCoarseDownsampleFactor)),
+            min(denseResolution.z, max(12, (denseResolution.z + gpuCollisionMeshSDFCoarseDownsampleFactor - 1) / gpuCollisionMeshSDFCoarseDownsampleFactor))
+        )
+        let atlasVoxelCount = atlasResolution.x * atlasResolution.y * atlasResolution.z
+        let coarseVoxelCount = coarseResolution.x * coarseResolution.y * coarseResolution.z
+        let indirectionVoxelCount = brickGrid.x * brickGrid.y * brickGrid.z
+        var atlasData = [Float](repeating: 0, count: atlasVoxelCount)
+        var indirectionData = [UInt32](repeating: UInt32.max, count: indirectionVoxelCount)
+        var coarseData = [Float](repeating: 0, count: coarseVoxelCount)
+
+        for (mappedIndex, brick) in mappedBricks.enumerated() {
+            indirectionData[collisionMeshSDFLinearIndex(x: brick.x, y: brick.y, z: brick.z, resolution: brickGrid)] = UInt32(mappedIndex)
+
+            let atlasBrickZ = mappedIndex / (gpuCollisionMeshSDFAtlasBricksAcross * gpuCollisionMeshSDFAtlasBricksAcross)
+            let atlasBrickY = (mappedIndex / gpuCollisionMeshSDFAtlasBricksAcross) % gpuCollisionMeshSDFAtlasBricksAcross
+            let atlasBrickX = mappedIndex % gpuCollisionMeshSDFAtlasBricksAcross
+            let atlasBaseX = atlasBrickX * gpuCollisionMeshSDFStoredBrickDim
+            let atlasBaseY = atlasBrickY * gpuCollisionMeshSDFStoredBrickDim
+            let atlasBaseZ = atlasBrickZ * gpuCollisionMeshSDFStoredBrickDim
+
+            for localZ in 0..<gpuCollisionMeshSDFStoredBrickDim {
+                let sourceZ = max(0, min(denseResolution.z - 1, brick.z * gpuCollisionMeshSDFBrickDim + localZ - gpuCollisionMeshSDFGuardVoxelCount))
+                for localY in 0..<gpuCollisionMeshSDFStoredBrickDim {
+                    let sourceY = max(0, min(denseResolution.y - 1, brick.y * gpuCollisionMeshSDFBrickDim + localY - gpuCollisionMeshSDFGuardVoxelCount))
+                    for localX in 0..<gpuCollisionMeshSDFStoredBrickDim {
+                        let sourceX = max(0, min(denseResolution.x - 1, brick.x * gpuCollisionMeshSDFBrickDim + localX - gpuCollisionMeshSDFGuardVoxelCount))
+                        let sourceIndex = collisionMeshSDFLinearIndex(x: sourceX, y: sourceY, z: sourceZ, resolution: denseResolution)
+                        let atlasIndex = collisionMeshSDFLinearIndex(
+                            x: atlasBaseX + localX,
+                            y: atlasBaseY + localY,
+                            z: atlasBaseZ + localZ,
+                            resolution: atlasResolution
+                        )
+                        atlasData[atlasIndex] = denseData[sourceIndex]
+                    }
+                }
+            }
+        }
+
+        for z in 0..<coarseResolution.z {
+            let uz = Float(z) / Float(max(coarseResolution.z - 1, 1))
+            for y in 0..<coarseResolution.y {
+                let uy = Float(y) / Float(max(coarseResolution.y - 1, 1))
+                for x in 0..<coarseResolution.x {
+                    let ux = Float(x) / Float(max(coarseResolution.x - 1, 1))
+                    coarseData[collisionMeshSDFLinearIndex(x: x, y: y, z: z, resolution: coarseResolution)] =
+                        sampleCollisionMeshSDFDenseData(
+                            denseData,
+                            resolution: denseResolution,
+                            uv: SIMD3<Float>(ux, uy, uz)
+                        )
+                }
+            }
+        }
+
+        return CollisionMeshSDFCompactionData(
+            coarseResolution: coarseResolution,
+            atlasResolution: atlasResolution,
+            brickGrid: brickGrid,
+            coarseData: coarseData,
+            atlasData: atlasData,
+            indirectionData: indirectionData,
+            mappedBrickCount: mappedBricks.count,
+            denseByteCount: denseData.count * MemoryLayout<Float>.stride,
+            compactedByteCount: (coarseVoxelCount + atlasVoxelCount) * MemoryLayout<Float>.stride
+                + indirectionVoxelCount * MemoryLayout<UInt32>.stride
+        )
+    }
+
+    private static func collisionMeshSDFBrickGrid(resolution: SIMD3<Int>) -> SIMD3<Int> {
+        SIMD3<Int>(
+            (resolution.x + gpuCollisionMeshSDFBrickDim - 1) / gpuCollisionMeshSDFBrickDim,
+            (resolution.y + gpuCollisionMeshSDFBrickDim - 1) / gpuCollisionMeshSDFBrickDim,
+            (resolution.z + gpuCollisionMeshSDFBrickDim - 1) / gpuCollisionMeshSDFBrickDim
+        )
+    }
+
+    static func collisionMeshSDFSparseBandHalfWidth(voxelSize: SIMD3<Float>) -> Float {
+        let brickWorldSize = voxelSize * Float(gpuCollisionMeshSDFStoredBrickDim)
+        let brickHalfDiagonal = 0.5 * simd_length(brickWorldSize)
+        let maxVoxel = max(voxelSize.x, max(voxelSize.y, voxelSize.z))
+        return brickHalfDiagonal + max(maxVoxel * 2.0, gpuCollisionMargin * 6.0)
+    }
+
+    private static func collisionMeshSDFLinearIndex(
+        x: Int,
+        y: Int,
+        z: Int,
+        resolution: SIMD3<Int>
+    ) -> Int {
+        (z * resolution.y + y) * resolution.x + x
+    }
+
+    private static func sampleCollisionMeshSDFDenseData(
+        _ denseData: [Float],
+        resolution: SIMD3<Int>,
+        uv: SIMD3<Float>
+    ) -> Float {
+        let size = SIMD3<Float>(
+            Float(max(resolution.x, 1)),
+            Float(max(resolution.y, 1)),
+            Float(max(resolution.z, 1))
+        )
+        let maxCoord = SIMD3<Float>(
+            Float(max(resolution.x - 1, 0)),
+            Float(max(resolution.y - 1, 0)),
+            Float(max(resolution.z - 1, 0))
+        )
+        let coord = simd_clamp(
+            simd_clamp(uv, SIMD3<Float>(repeating: 0), SIMD3<Float>(repeating: 1)) * size - 0.5,
+            SIMD3<Float>(repeating: 0),
+            maxCoord
+        )
+        let x0 = Int(floor(coord.x))
+        let y0 = Int(floor(coord.y))
+        let z0 = Int(floor(coord.z))
+        let x1 = min(x0 + 1, resolution.x - 1)
+        let y1 = min(y0 + 1, resolution.y - 1)
+        let z1 = min(z0 + 1, resolution.z - 1)
+        let tx = coord.x - Float(x0)
+        let ty = coord.y - Float(y0)
+        let tz = coord.z - Float(z0)
+
+        func value(_ x: Int, _ y: Int, _ z: Int) -> Float {
+            denseData[collisionMeshSDFLinearIndex(x: x, y: y, z: z, resolution: resolution)]
+        }
+
+        let c000 = value(x0, y0, z0)
+        let c100 = value(x1, y0, z0)
+        let c010 = value(x0, y1, z0)
+        let c110 = value(x1, y1, z0)
+        let c001 = value(x0, y0, z1)
+        let c101 = value(x1, y0, z1)
+        let c011 = value(x0, y1, z1)
+        let c111 = value(x1, y1, z1)
+
+        let c00 = c000 + (c100 - c000) * tx
+        let c10 = c010 + (c110 - c010) * tx
+        let c01 = c001 + (c101 - c001) * tx
+        let c11 = c011 + (c111 - c011) * tx
+        let c0 = c00 + (c10 - c00) * ty
+        let c1 = c01 + (c11 - c01) * ty
+        return c0 + (c1 - c0) * tz
+    }
+
+    static func collisionMeshSDFPadding(for mesh: AVBDCollisionMeshBroadphaseMesh) -> SIMD3<Float> {
         let extent = max(mesh.localBoundsMax - mesh.localBoundsMin, SIMD3<Float>(repeating: 1.0e-3))
         return max(extent * 0.05, SIMD3<Float>(repeating: gpuCollisionMargin * 4.0))
     }
 
-    private static func collisionMeshSDFResolution(
+    static func collisionMeshSDFResolution(
         localMinBounds: SIMD3<Float>,
         localMaxBounds: SIMD3<Float>
     ) -> SIMD3<Int32> {
