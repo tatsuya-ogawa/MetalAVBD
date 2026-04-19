@@ -37,6 +37,8 @@ private let gpuCollisionMeshSDFMappedBrickDilation = 1
 private let gpuMaxCollisionMeshSDFs = Int(AVBD_MAX_COLLISION_MESH_SDFS)
 private let gpuCollisionMeshSDFAtlasTextureBaseIndex = gpuMaxCollisionMeshSDFs
 private let gpuCollisionMeshSDFIndirectionTextureBaseIndex = gpuMaxCollisionMeshSDFs * 2
+private let gpuMeshMeshIsoVoxelTrackedPairLimit = 1024
+private let gpuMeshMeshIsoVoxelCoordsPerPair = 32
 
 private struct AVBDGPUOBB {
     var center: SIMD3<Float>
@@ -74,6 +76,20 @@ struct AVBDCollisionMeshBroadphaseMesh {
 }
 
 final class AVBDGPUSolver {
+    struct MeshMeshIsoVoxelDebugEntry {
+        var meshIndexA: Int
+        var meshIndexB: Int
+        var driverMeshIndex: Int
+        var sampledVoxelCount: Int
+        var candidateVoxelCount: Int
+        var compactedVoxelCount: Int
+        var sampleStride: Int
+        var overflowed: Bool
+        var emittedContactCount: Int
+        var usedIsoVoxelPath: Bool
+        var voxelCoords: [SIMD3<Int32>]
+    }
+
     private struct CollisionMeshSDFResource {
         var coarseTexture: MTLTexture
         var atlasTexture: MTLTexture
@@ -158,6 +174,9 @@ final class AVBDGPUSolver {
     var gamma: Float = 0.999
     var linearDamping: Float = 0.0
     var angularDamping: Float = 0.0
+    var hydroelasticInteriorWeight: Float = 0.5
+    var meshMeshMaxIsoVoxelSamples: Int = 512
+    var meshMeshReduceContacts: Bool = true
     private var _broadphaseCacheMargin: Float = 0.1
     private var _broadphaseFullRefreshStepCount: Int = 60
 
@@ -178,6 +197,8 @@ final class AVBDGPUSolver {
     }
 
     var enableContactWarmstart: Bool = true
+    var enablePrimitiveMeshCollisions: Bool = true
+    var enableMeshMeshCollisions: Bool = true
 
     // Extra capacity for dynamically thrown bodies
     private static let extraBodyCapacity = 50
@@ -211,6 +232,7 @@ final class AVBDGPUSolver {
     private var prevActiveManifoldIndexBuffer: MTLBuffer
     private var prevActiveManifoldStateBuffer: MTLBuffer
     private var collisionMeshInfoBuffer: MTLBuffer
+    private var collisionMeshOwnerBodyMaskBuffer: MTLBuffer
     private var collisionMeshVertexBuffer: MTLBuffer
     private var collisionMeshIndexBuffer: MTLBuffer
     private var primitiveMeshPairBuffer: MTLBuffer
@@ -219,16 +241,20 @@ final class AVBDGPUSolver {
     private var meshMeshPairBuffer: MTLBuffer
     private var meshMeshPairStateBuffer: MTLBuffer
     private var meshMeshPairIndirectBuffer: MTLBuffer
+    private var meshMeshIsoVoxelDebugBuffer: MTLBuffer
+    private var meshMeshIsoVoxelCoordBuffer: MTLBuffer
     private var paramsBuffer: MTLBuffer
     private var maxCollisions: Int
     private var bodyBodyManifoldCapacity: Int
     private var primitiveMeshManifoldCapacity: Int
+    private var meshMeshManifoldCapacity: Int
     private var recentPairCapacity: Int
     private var contactCapacity: Int
     private var collisionMeshCapacity: Int
     private var collisionMeshCount: Int
     private var primitiveMeshPairCapacity: Int
     private var meshMeshPairCapacity: Int
+    private var meshMeshIsoVoxelTrackedPairCapacity: Int
     private var recentPairCacheSlot: Int
 
     // CPU-side setup/reference copies for static constraints and initial upload
@@ -541,6 +567,7 @@ final class AVBDGPUSolver {
 
         forceFullBroadphase = true
         collisionMeshSDFStatusText = !collisionMeshSDFResources.isEmpty ? "Cached" : "Idle"
+        refreshCollisionMeshOwnerBodyMask()
         return true
     }
 
@@ -549,6 +576,7 @@ final class AVBDGPUSolver {
         guard collisionMeshCount < min(collisionMeshCapacity, gpuMaxCollisionMeshSDFs) else {
             return false
         }
+        ensureCollisionCapacity(forMeshCount: collisionMeshCount + 1)
 
         let sdfPadding = Self.collisionMeshSDFPadding(for: mesh)
         let sdfLocalMinBounds = mesh.localBoundsMin - sdfPadding
@@ -606,6 +634,7 @@ final class AVBDGPUSolver {
         collisionMeshCount += 1
         forceFullBroadphase = true
         collisionMeshSDFStatusText = "Cached"
+        refreshCollisionMeshOwnerBodyMask()
         return true
     }
 
@@ -772,12 +801,14 @@ final class AVBDGPUSolver {
         let maxCollisionsPerBody = Int(AVBD_MAX_COLLISIONS_PER_BODY)
         bodyBodyManifoldCapacity = max(bodyCapacity * maxCollisionsPerBody, 1)
         primitiveMeshManifoldCapacity = 1
-        maxCollisions = bodyBodyManifoldCapacity + primitiveMeshManifoldCapacity
+        meshMeshManifoldCapacity = 1
+        maxCollisions = bodyBodyManifoldCapacity + primitiveMeshManifoldCapacity + meshMeshManifoldCapacity
         recentPairCapacity = max(bodyCapacity * (bodyCapacity - 1) / 2, 1)
         collisionMeshCapacity = 1024
         collisionMeshCount = 0
         primitiveMeshPairCapacity = max(bodyCapacity * collisionMeshCapacity, 1)
         meshMeshPairCapacity = max(collisionMeshCapacity * max(collisionMeshCapacity - 1, 0) / 2, 1)
+        meshMeshIsoVoxelTrackedPairCapacity = 1
 
         let bodyBufSize = max(MemoryLayout<AVBDGPUBody>.stride * bodyCapacity, 16)
         let bodyColorBufSize = max(MemoryLayout<Int32>.stride * bodyCapacity, 16)
@@ -800,6 +831,7 @@ final class AVBDGPUSolver {
         let activeManifoldStateBufSize = max(MemoryLayout<AVBDGPUActiveManifoldListState>.stride, 16)
         let activeManifoldIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
         let collisionMeshInfoBufSize = max(MemoryLayout<AVBDGPUCollisionMeshInfo>.stride * collisionMeshCapacity, 16)
+        let collisionMeshOwnerBodyMaskBufSize = max(MemoryLayout<Int32>.stride * bodyCapacity, 16)
         let collisionMeshVertexBufSize = max(MemoryLayout<SIMD3<Float>>.stride, 16)
         let collisionMeshIndexBufSize = max(MemoryLayout<UInt32>.stride, 16)
         let primitiveMeshPairBufSize = max(MemoryLayout<AVBDGPUPrimitiveMeshPair>.stride * primitiveMeshPairCapacity, 16)
@@ -808,6 +840,13 @@ final class AVBDGPUSolver {
         let meshMeshPairBufSize = max(MemoryLayout<AVBDGPUMeshMeshPair>.stride * meshMeshPairCapacity, 16)
         let meshMeshPairStateBufSize = max(MemoryLayout<AVBDGPUMeshMeshPairListState>.stride, 16)
         let meshMeshPairIndirectBufSize = max(MemoryLayout<AVBDGPUIndirectDispatchArgs>.stride, 16)
+        let meshMeshIsoVoxelDebugBufSize = max(MemoryLayout<AVBDGPUMeshMeshIsoVoxelDebug>.stride * meshMeshIsoVoxelTrackedPairCapacity, 16)
+        let meshMeshIsoVoxelCoordBufSize = max(
+            MemoryLayout<AVBDGPUMeshMeshIsoVoxelCoord>.stride
+                * meshMeshIsoVoxelTrackedPairCapacity
+                * gpuMeshMeshIsoVoxelCoordsPerPair,
+            16
+        )
 
         guard let bb = device.makeBuffer(length: bodyBufSize, options: .storageModeShared),
               let bcb = device.makeBuffer(length: bodyColorBufSize, options: .storageModeShared),
@@ -837,6 +876,7 @@ final class AVBDGPUSolver {
               let pami = device.makeBuffer(length: activeManifoldIndexBufSize, options: .storageModeShared),
               let pams = device.makeBuffer(length: activeManifoldStateBufSize, options: .storageModeShared),
               let cmi = device.makeBuffer(length: collisionMeshInfoBufSize, options: .storageModeShared),
+              let cmob = device.makeBuffer(length: collisionMeshOwnerBodyMaskBufSize, options: .storageModeShared),
               let cmv = device.makeBuffer(length: collisionMeshVertexBufSize, options: .storageModeShared),
               let cmii = device.makeBuffer(length: collisionMeshIndexBufSize, options: .storageModeShared),
               let pmp = device.makeBuffer(length: primitiveMeshPairBufSize, options: .storageModeShared),
@@ -845,6 +885,8 @@ final class AVBDGPUSolver {
               let mmp = device.makeBuffer(length: meshMeshPairBufSize, options: .storageModeShared),
               let mmps = device.makeBuffer(length: meshMeshPairStateBufSize, options: .storageModeShared),
               let mmpi = device.makeBuffer(length: meshMeshPairIndirectBufSize, options: .storageModeShared),
+              let mmiv = device.makeBuffer(length: meshMeshIsoVoxelDebugBufSize, options: .storageModeShared),
+              let mmic = device.makeBuffer(length: meshMeshIsoVoxelCoordBufSize, options: .storageModeShared),
               let pb = device.makeBuffer(length: MemoryLayout<AVBDGPUSolverParams>.stride, options: .storageModeShared)
         else { return nil }
 
@@ -873,6 +915,7 @@ final class AVBDGPUSolver {
         prevActiveManifoldIndexBuffer = pami
         prevActiveManifoldStateBuffer = pams
         collisionMeshInfoBuffer = cmi
+        collisionMeshOwnerBodyMaskBuffer = cmob
         collisionMeshVertexBuffer = cmv
         collisionMeshIndexBuffer = cmii
         primitiveMeshPairBuffer = pmp
@@ -881,6 +924,8 @@ final class AVBDGPUSolver {
         meshMeshPairBuffer = mmp
         meshMeshPairStateBuffer = mmps
         meshMeshPairIndirectBuffer = mmpi
+        meshMeshIsoVoxelDebugBuffer = mmiv
+        meshMeshIsoVoxelCoordBuffer = mmic
         paramsBuffer = pb
         contactCapacity = maxCollisions * SWIFT_AVBD_MAX_CONTACTS_PER_PAIR
         recentPairCacheSlot = 0
@@ -917,6 +962,11 @@ final class AVBDGPUSolver {
 
         let primitiveMeshPairStatePtr = primitiveMeshPairStateBuffer.contents().bindMemory(to: AVBDGPUPrimitiveMeshPairListState.self, capacity: 1)
         primitiveMeshPairStatePtr.pointee = AVBDGPUPrimitiveMeshPairListState(count: Int32(0), capacity: Int32(primitiveMeshPairCapacity))
+        collisionMeshOwnerBodyMaskBuffer.contents().initializeMemory(
+            as: UInt8.self,
+            repeating: 0,
+            count: collisionMeshOwnerBodyMaskBuffer.length
+        )
 
         let primitiveMeshPairIndirectPtr = primitiveMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
         primitiveMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
@@ -929,6 +979,16 @@ final class AVBDGPUSolver {
 
         let meshMeshPairIndirectPtr = meshMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
         meshMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+        meshMeshIsoVoxelDebugBuffer.contents().initializeMemory(
+            as: UInt8.self,
+            repeating: 0,
+            count: meshMeshIsoVoxelDebugBuffer.length
+        )
+        meshMeshIsoVoxelCoordBuffer.contents().initializeMemory(
+            as: UInt8.self,
+            repeating: 0,
+            count: meshMeshIsoVoxelCoordBuffer.length
+        )
 
         uploadBodies()
         uploadRenderColors(scene.bodies.map(\.renderColor))
@@ -1127,6 +1187,15 @@ final class AVBDGPUSolver {
         let primitiveMeshPairIndirectPtr = primitiveMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
         primitiveMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
 
+        let meshMeshPairStatePtr = meshMeshPairStateBuffer.contents().bindMemory(to: AVBDGPUMeshMeshPairListState.self, capacity: 1)
+        meshMeshPairStatePtr.pointee = AVBDGPUMeshMeshPairListState(
+            count: Int32(0),
+            capacity: Int32(meshMeshPairCapacity)
+        )
+
+        let meshMeshPairIndirectPtr = meshMeshPairIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
+        meshMeshPairIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+
         // Blit previous frame's manifold/contact data for warmstarting
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.copy(from: manifoldBuffer, sourceOffset: 0, to: prevManifoldBuffer, destinationOffset: 0, size: manifoldBuffer.length)
@@ -1159,7 +1228,7 @@ final class AVBDGPUSolver {
             height: 1,
             depth: 1
         )
-        let meshMeshBroadphasePairCount = max(collisionMeshCount * collisionMeshCount, 1)
+        let meshMeshBroadphasePairCount = max(collisionMeshCount * max(collisionMeshCount - 1, 0) / 2, 1)
         let meshMeshBroadphaseWidth = meshMeshBroadphasePSO.threadExecutionWidth
         let meshMeshBroadphaseThreads = MTLSize(width: meshMeshBroadphasePairCount, height: 1, depth: 1)
         let meshMeshCollisionThreadgroupSize = MTLSize(width: collideMeshMeshPSO.threadExecutionWidth, height: 1, depth: 1)
@@ -1233,13 +1302,14 @@ final class AVBDGPUSolver {
             threadsPerThreadgroup: derivedThreadgroupSize
         )
 
-        if collisionMeshCount > 0 && bodyCount > 0 {
+        if enablePrimitiveMeshCollisions && collisionMeshCount > 0 && bodyCount > 0 {
             encoder.setComputePipelineState(primitiveMeshBroadphasePSO)
             encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
             encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 1)
             encoder.setBuffer(primitiveMeshPairBuffer, offset: 0, index: 2)
             encoder.setBuffer(primitiveMeshPairStateBuffer, offset: 0, index: 3)
-            encoder.setBuffer(paramsBuffer, offset: 0, index: 4)
+            encoder.setBuffer(collisionMeshOwnerBodyMaskBuffer, offset: 0, index: 4)
+            encoder.setBuffer(paramsBuffer, offset: 0, index: 5)
             encoder.dispatchThreads(
                 primitiveMeshBroadphaseThreads,
                 threadsPerThreadgroup: MTLSize(width: primitiveMeshBroadphaseWidth, height: 1, depth: 1)
@@ -1288,7 +1358,7 @@ final class AVBDGPUSolver {
             )
         }
 
-        if collisionMeshCount > 1 {
+        if enableMeshMeshCollisions && collisionMeshCount > 1 {
             encoder.setComputePipelineState(meshMeshBroadphasePSO)
             encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 0)
             encoder.setBuffer(meshMeshPairBuffer, offset: 0, index: 1)
@@ -1307,16 +1377,36 @@ final class AVBDGPUSolver {
                 threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
             )
 
-            encoder.setComputePipelineState(collideMeshMeshPSO)
-            encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 0)
-            encoder.setBuffer(meshMeshPairBuffer, offset: 0, index: 1)
-            encoder.setBuffer(meshMeshPairStateBuffer, offset: 0, index: 2)
-            encoder.setBuffer(paramsBuffer, offset: 0, index: 3)
-            encoder.dispatchThreadgroups(
-                indirectBuffer: meshMeshPairIndirectBuffer,
-                indirectBufferOffset: 0,
-                threadsPerThreadgroup: meshMeshCollisionThreadgroupSize
-            )
+            let useMeshMeshSDF = collisionMeshSDFArgumentBuffer != nil
+                && !collisionMeshSDFResources.isEmpty
+            if useMeshMeshSDF {
+                encoder.setComputePipelineState(collideMeshMeshPSO)
+                encoder.setBuffer(bodyBuffer, offset: 0, index: 0)
+                encoder.setBuffer(collisionMeshInfoBuffer, offset: 0, index: 1)
+                encoder.setBuffer(meshMeshPairBuffer, offset: 0, index: 2)
+                encoder.setBuffer(meshMeshPairStateBuffer, offset: 0, index: 3)
+                encoder.setBuffer(paramsBuffer, offset: 0, index: 4)
+                encoder.setBuffer(manifoldBuffer, offset: 0, index: 5)
+                encoder.setBuffer(contactBuffer, offset: 0, index: 6)
+                encoder.setBuffer(contactAllocatorBuffer, offset: 0, index: 7)
+                encoder.setBuffer(activeManifoldIndexBuffer, offset: 0, index: 8)
+                encoder.setBuffer(activeManifoldStateBuffer, offset: 0, index: 9)
+                if let collisionMeshSDFArgumentBuffer {
+                    encoder.setBuffer(collisionMeshSDFArgumentBuffer, offset: 0, index: 10)
+                }
+                encoder.setBuffer(meshMeshIsoVoxelDebugBuffer, offset: 0, index: 11)
+                encoder.setBuffer(meshMeshIsoVoxelCoordBuffer, offset: 0, index: 12)
+                for resource in collisionMeshSDFResources {
+                    encoder.useResource(resource.coarseTexture, usage: .read)
+                    encoder.useResource(resource.atlasTexture, usage: .read)
+                    encoder.useResource(resource.indirectionTexture, usage: .read)
+                }
+                encoder.dispatchThreadgroups(
+                    indirectBuffer: meshMeshPairIndirectBuffer,
+                    indirectBufferOffset: 0,
+                    threadsPerThreadgroup: meshMeshCollisionThreadgroupSize
+                )
+            }
         }
 
         // Prepare active manifold indirect dispatch args AFTER all manifold
@@ -1460,6 +1550,48 @@ final class AVBDGPUSolver {
     func readBodies() -> [AVBDGPUBody] {
         let ptr = bodyBuffer.contents().bindMemory(to: AVBDGPUBody.self, capacity: bodyCount)
         return (0..<bodyCount).map { ptr[$0] }
+    }
+
+    func readMeshMeshIsoVoxelDebugEntries(includeZeroCandidates: Bool = false) -> [MeshMeshIsoVoxelDebugEntry] {
+        let pairCountPtr = meshMeshPairStateBuffer.contents().bindMemory(to: AVBDGPUMeshMeshPairListState.self, capacity: 1)
+        let pairCount = max(0, min(Int(pairCountPtr.pointee.count), meshMeshIsoVoxelTrackedPairCapacity))
+        guard pairCount > 0 else { return [] }
+
+        let ptr = meshMeshIsoVoxelDebugBuffer.contents().bindMemory(
+            to: AVBDGPUMeshMeshIsoVoxelDebug.self,
+            capacity: pairCount
+        )
+        let coordPtr = meshMeshIsoVoxelCoordBuffer.contents().bindMemory(
+            to: AVBDGPUMeshMeshIsoVoxelCoord.self,
+            capacity: max(meshMeshIsoVoxelTrackedPairCapacity * gpuMeshMeshIsoVoxelCoordsPerPair, 1)
+        )
+
+        return (0..<pairCount).compactMap { index in
+            let entry = ptr[index]
+            guard entry.valid != 0 else { return nil }
+            if !includeZeroCandidates && entry.candidateVoxelCount <= 0 {
+                return nil
+            }
+            let compactedCount = max(0, min(Int(entry.compactedVoxelCount), gpuMeshMeshIsoVoxelCoordsPerPair))
+            let coordBase = index * gpuMeshMeshIsoVoxelCoordsPerPair
+            let voxelCoords = (0..<compactedCount).map { coordIndex -> SIMD3<Int32> in
+                let packed = coordPtr[coordBase + coordIndex].voxelCoord
+                return SIMD3<Int32>(packed.x, packed.y, packed.z)
+            }
+            return MeshMeshIsoVoxelDebugEntry(
+                meshIndexA: Int(entry.meshIndexA),
+                meshIndexB: Int(entry.meshIndexB),
+                driverMeshIndex: Int(entry.driverMeshIndex),
+                sampledVoxelCount: Int(entry.sampledVoxelCount),
+                candidateVoxelCount: Int(entry.candidateVoxelCount),
+                compactedVoxelCount: compactedCount,
+                sampleStride: Int(entry.sampleStride),
+                overflowed: entry.overflowed != 0,
+                emittedContactCount: Int(entry.emittedContactCount),
+                usedIsoVoxelPath: entry.usedIsoVoxelPath != 0,
+                voxelCoords: voxelCoords
+            )
+        }
     }
 
     // MARK: - Buffer Transfers
@@ -1718,6 +1850,9 @@ final class AVBDGPUSolver {
             springCount: Int32(cpuSprings.count),
             meshCount: Int32(collisionMeshCount),
             primitiveMeshManifoldOffset: Int32(bodyBodyManifoldCapacity),
+            meshMeshManifoldOffset: Int32(bodyBodyManifoldCapacity + primitiveMeshManifoldCapacity),
+            meshMeshIsoVoxelTrackedPairCapacity: Int32(meshMeshIsoVoxelTrackedPairCapacity),
+            meshMeshIsoVoxelCoordsPerPair: Int32(gpuMeshMeshIsoVoxelCoordsPerPair),
             collisionMargin: gpuCollisionMargin,
             cacheMargin: effectiveCacheMargin,
             cacheTimeHorizon: cacheTimeHorizon,
@@ -1727,7 +1862,10 @@ final class AVBDGPUSolver {
             torusApproxSphereCount: Int32(avbdCurrentTorusApproxSphereCount()),
             torusApproxSphereRadiusScale: AVBDTorusApproximationSettings.radiusScale,
             linearDamping: linearDamping,
-            angularDamping: angularDamping
+            angularDamping: angularDamping,
+            hydroelasticInteriorWeight: hydroelasticInteriorWeight,
+            meshMeshMaxIsoVoxelSamples: Int32(max(8, min(meshMeshMaxIsoVoxelSamples, 4096))),
+            meshMeshReduceContacts: meshMeshReduceContacts ? 1 : 0
         )
     }
 
@@ -1896,6 +2034,7 @@ final class AVBDGPUSolver {
 
         self.collisionMeshSDFResources = collisionMeshSDFResources
         updateCollisionMeshSDFArgumentBufferBindings()
+        refreshCollisionMeshOwnerBodyMask()
 
         let buildDurationMS = (CACurrentMediaTime() - buildStartTime) * 1000.0
         if collisionMeshCount == 0 {
@@ -1930,6 +2069,31 @@ final class AVBDGPUSolver {
         }
 
         forceFullBroadphase = true
+    }
+
+    private func refreshCollisionMeshOwnerBodyMask() {
+        let ownerMaskPtr = collisionMeshOwnerBodyMaskBuffer.contents().bindMemory(
+            to: Int32.self,
+            capacity: max(bodyCapacity, 1)
+        )
+        for bodyIndex in 0..<max(bodyCapacity, 1) {
+            ownerMaskPtr[bodyIndex] = 0
+        }
+
+        guard collisionMeshCount > 0 else {
+            return
+        }
+
+        let infoPtr = collisionMeshInfoBuffer.contents().bindMemory(
+            to: AVBDGPUCollisionMeshInfo.self,
+            capacity: max(collisionMeshCapacity, 1)
+        )
+        for meshIndex in 0..<collisionMeshCount {
+            let ownerBodyIndex = Int(infoPtr[meshIndex].ownerBodyIndex)
+            if ownerBodyIndex >= 0 && ownerBodyIndex < bodyCapacity {
+                ownerMaskPtr[ownerBodyIndex] = 1
+            }
+        }
     }
 
     private func buildCollisionMeshSDFTexture(
@@ -2504,9 +2668,15 @@ final class AVBDGPUSolver {
 
     private func ensureCollisionCapacity(forMeshCount meshCount: Int) {
         let requiredPrimitiveMeshManifoldCapacity = max(bodyCapacity * max(meshCount, 1), 1)
-        let requiredMaxCollisions = bodyBodyManifoldCapacity + requiredPrimitiveMeshManifoldCapacity
+        let requiredMeshMeshManifoldCapacity = max(meshCount * max(meshCount - 1, 0) / 2, 1)
+        let requiredTrackedPairCapacity = max(min(requiredMeshMeshManifoldCapacity, gpuMeshMeshIsoVoxelTrackedPairLimit), 1)
+        let requiredMaxCollisions = bodyBodyManifoldCapacity
+            + requiredPrimitiveMeshManifoldCapacity
+            + requiredMeshMeshManifoldCapacity
         if requiredMaxCollisions <= maxCollisions {
             primitiveMeshManifoldCapacity = requiredPrimitiveMeshManifoldCapacity
+            meshMeshManifoldCapacity = requiredMeshMeshManifoldCapacity
+            ensureMeshMeshIsoVoxelDebugCapacity(forTrackedPairCount: requiredTrackedPairCapacity)
             return
         }
 
@@ -2539,8 +2709,10 @@ final class AVBDGPUSolver {
         prevActiveManifoldIndexBuffer = pami
         prevActiveManifoldStateBuffer = pams
         primitiveMeshManifoldCapacity = requiredPrimitiveMeshManifoldCapacity
+        meshMeshManifoldCapacity = requiredMeshMeshManifoldCapacity
         maxCollisions = requiredMaxCollisions
         contactCapacity = requiredMaxCollisions * SWIFT_AVBD_MAX_CONTACTS_PER_PAIR
+        ensureMeshMeshIsoVoxelDebugCapacity(forTrackedPairCount: requiredTrackedPairCapacity)
 
         let allocatorPtr = contactAllocatorBuffer.contents().bindMemory(to: AVBDGPUContactAllocator.self, capacity: 1)
         allocatorPtr.pointee = AVBDGPUContactAllocator(nextContactIndex: Int32(0), contactCapacity: Int32(contactCapacity))
@@ -2553,6 +2725,38 @@ final class AVBDGPUSolver {
 
         let activeManifoldIndirectPtr = activeManifoldIndirectBuffer.contents().bindMemory(to: AVBDGPUIndirectDispatchArgs.self, capacity: 1)
         activeManifoldIndirectPtr.pointee = AVBDGPUIndirectDispatchArgs(threadgroupsPerGrid: (0, 1, 1))
+    }
+
+    private func ensureMeshMeshIsoVoxelDebugCapacity(forTrackedPairCount trackedPairCount: Int) {
+        let requiredTrackedPairCount = max(trackedPairCount, 1)
+        let requiredDebugBufSize = max(
+            MemoryLayout<AVBDGPUMeshMeshIsoVoxelDebug>.stride * requiredTrackedPairCount,
+            16
+        )
+        let requiredCoordBufSize = max(
+            MemoryLayout<AVBDGPUMeshMeshIsoVoxelCoord>.stride
+                * requiredTrackedPairCount
+                * gpuMeshMeshIsoVoxelCoordsPerPair,
+            16
+        )
+
+        if meshMeshIsoVoxelDebugBuffer.length < requiredDebugBufSize {
+            guard let newBuffer = device.makeBuffer(length: requiredDebugBufSize, options: .storageModeShared) else {
+                return
+            }
+            newBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: newBuffer.length)
+            meshMeshIsoVoxelDebugBuffer = newBuffer
+        }
+
+        if meshMeshIsoVoxelCoordBuffer.length < requiredCoordBufSize {
+            guard let newBuffer = device.makeBuffer(length: requiredCoordBufSize, options: .storageModeShared) else {
+                return
+            }
+            newBuffer.contents().initializeMemory(as: UInt8.self, repeating: 0, count: newBuffer.length)
+            meshMeshIsoVoxelCoordBuffer = newBuffer
+        }
+
+        meshMeshIsoVoxelTrackedPairCapacity = requiredTrackedPairCount
     }
 
     private static func worldBounds(

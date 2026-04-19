@@ -178,6 +178,24 @@ typedef struct {
     int capacity;
 } AVBDGPUMeshMeshPairListState;
 
+typedef struct {
+    int meshIndexA;
+    int meshIndexB;
+    int driverMeshIndex;
+    int sampledVoxelCount;
+    int candidateVoxelCount;
+    int compactedVoxelCount;
+    int sampleStride;
+    int overflowed;
+    int valid;
+    int emittedContactCount;
+    int usedIsoVoxelPath;
+} AVBDGPUMeshMeshIsoVoxelDebug;
+
+typedef struct {
+    vector_int4 voxelCoord;
+} AVBDGPUMeshMeshIsoVoxelCoord;
+
 // Matches MTLDispatchThreadgroupsIndirectArguments layout.
 typedef struct {
     unsigned int threadgroupsPerGrid[3];
@@ -207,6 +225,9 @@ typedef struct {
     int springCount;
     int meshCount;
     int primitiveMeshManifoldOffset;
+    int meshMeshManifoldOffset;
+    int meshMeshIsoVoxelTrackedPairCapacity;
+    int meshMeshIsoVoxelCoordsPerPair;
     float collisionMargin;
     float cacheMargin;
     float cacheTimeHorizon;
@@ -217,6 +238,9 @@ typedef struct {
     float torusApproxSphereRadiusScale;
     float linearDamping;
     float angularDamping;
+    float hydroelasticInteriorWeight;
+    int meshMeshMaxIsoVoxelSamples;
+    int meshMeshReduceContacts;
 } AVBDGPUSolverParams;
 
 #endif /* AVBDComputeTypes_h */

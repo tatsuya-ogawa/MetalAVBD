@@ -1187,6 +1187,33 @@ class Renderer: NSObject, MTKViewDelegate {
         applySimulationParameters()
     }
 
+    @MainActor
+    func setMeshMeshMaxIsoVoxelSamples(_ samples: Int) {
+        gpuSolver?.meshMeshMaxIsoVoxelSamples = max(8, min(samples, 4096))
+    }
+
+    var currentMeshMeshMaxIsoVoxelSamples: Int {
+        gpuSolver?.meshMeshMaxIsoVoxelSamples ?? 512
+    }
+
+    @MainActor
+    func setMeshMeshReduceContacts(_ enabled: Bool) {
+        gpuSolver?.meshMeshReduceContacts = enabled
+    }
+
+    var currentMeshMeshReduceContacts: Bool {
+        gpuSolver?.meshMeshReduceContacts ?? true
+    }
+
+    @MainActor
+    func setHydroelasticInteriorWeight(_ weight: Float) {
+        gpuSolver?.hydroelasticInteriorWeight = max(0.0, min(weight, 1.0))
+    }
+
+    var currentHydroelasticInteriorWeight: Float {
+        gpuSolver?.hydroelasticInteriorWeight ?? 0.5
+    }
+
     func setTorusVisualMode(_ mode: AVBDTorusVisualMode) {
         currentTorusVisualMode = mode
         populateRenderInstances()
