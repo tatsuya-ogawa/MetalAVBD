@@ -506,10 +506,15 @@ static bool ray_triangle_intersection(float3 origin,
 }
 
 struct AVBDCollisionMeshSDFSet {
-    array<texture3d<float, access::sample>, AVBD_MAX_COLLISION_MESH_SDFS> sdf [[id(0)]];
+    array<texture3d<float, access::sample>, AVBD_MAX_COLLISION_MESH_SDFS> coarse [[id(0)]];
+    array<texture3d<float, access::sample>, AVBD_MAX_COLLISION_MESH_SDFS> atlas [[id(64)]];
+    array<texture3d<uint, access::read>, AVBD_MAX_COLLISION_MESH_SDFS> indirection [[id(128)]];
 };
 
 constant float3 AVBD_GPU_SDF_RAY_DIRECTION = float3(0.728492f, 0.514883f, 0.452173f);
+constant int AVBD_COLLISION_MESH_SDF_BRICK_DIM = 8;
+constant int AVBD_COLLISION_MESH_SDF_GUARD_VOXELS = 1;
+constant int AVBD_COLLISION_MESH_SDF_STORED_BRICK_DIM = 10;
 constexpr sampler avbd_sdf_sampler(coord::normalized, filter::linear, address::clamp_to_edge);
 
 static float point_segment_distance(float3 point, float3 a, float3 b) {
@@ -568,26 +573,60 @@ static float3 collision_mesh_sdf_texcoord(float3 pointLocal, device const AVBDGP
     return (pointLocal - meshInfo.sdfLocalMinBounds.xyz) / extent;
 }
 
-static float sample_collision_mesh_sdf_value(texture3d<float, access::sample> sdfTexture,
+static float sample_collision_mesh_sdf_value(constant AVBDCollisionMeshSDFSet &meshSDFSet,
+                                             int sdfResourceIndex,
                                              float3 pointLocal,
                                              device const AVBDGPUCollisionMeshInfo &meshInfo) {
     float3 texCoord = collision_mesh_sdf_texcoord(pointLocal, meshInfo);
     if (any(texCoord < 0.0f) || any(texCoord > 1.0f)) {
         return FLT_MAX;
     }
-    return sdfTexture.sample(avbd_sdf_sampler, texCoord).r;
+
+    texture3d<float, access::sample> coarseTexture = meshSDFSet.coarse[sdfResourceIndex];
+    texture3d<float, access::sample> atlasTexture = meshSDFSet.atlas[sdfResourceIndex];
+    texture3d<uint, access::read> indirectionTexture = meshSDFSet.indirection[sdfResourceIndex];
+
+    float3 resolution = max(float3(meshInfo.sdfResolution.xyz), float3(1.0f));
+    float3 sampleCoord = clamp(texCoord * resolution - 0.5f, float3(0.0f), resolution - float3(1.0f));
+    int3 brickIdx = int3(floor(sampleCoord / float(AVBD_COLLISION_MESH_SDF_BRICK_DIM)));
+    int3 brickGrid = int3(indirectionTexture.get_width(), indirectionTexture.get_height(), indirectionTexture.get_depth());
+    if (any(brickIdx < 0) || any(brickIdx >= brickGrid)) {
+        return coarseTexture.sample(avbd_sdf_sampler, texCoord).r;
+    }
+
+    uint brickAtlasIdx = indirectionTexture.read(uint3(brickIdx)).r;
+    if (brickAtlasIdx == 0xFFFFFFFFu) {
+        return coarseTexture.sample(avbd_sdf_sampler, texCoord).r;
+    }
+
+    float3 localPos = sampleCoord - float3(brickIdx * AVBD_COLLISION_MESH_SDF_BRICK_DIM);
+    int atlasBricksAcross = max(int(atlasTexture.get_width()) / AVBD_COLLISION_MESH_SDF_STORED_BRICK_DIM, 1);
+    int atlasBricksDown = max(int(atlasTexture.get_height()) / AVBD_COLLISION_MESH_SDF_STORED_BRICK_DIM, 1);
+    int atlasLayerStride = atlasBricksAcross * atlasBricksDown;
+    int atlasIndex = int(brickAtlasIdx);
+    int atlasBrickZ = atlasIndex / atlasLayerStride;
+    int atlasBrickY = (atlasIndex / atlasBricksAcross) % atlasBricksDown;
+    int atlasBrickX = atlasIndex % atlasBricksAcross;
+    float3 atlasCoord = float3(
+        atlasBrickX * AVBD_COLLISION_MESH_SDF_STORED_BRICK_DIM,
+        atlasBrickY * AVBD_COLLISION_MESH_SDF_STORED_BRICK_DIM,
+        atlasBrickZ * AVBD_COLLISION_MESH_SDF_STORED_BRICK_DIM
+    ) + float(AVBD_COLLISION_MESH_SDF_GUARD_VOXELS) + localPos;
+    float3 atlasSize = float3(atlasTexture.get_width(), atlasTexture.get_height(), atlasTexture.get_depth());
+    return atlasTexture.sample(avbd_sdf_sampler, (atlasCoord + 0.5f) / atlasSize).r;
 }
 
-static float3 collision_mesh_sdf_local_normal(texture3d<float, access::sample> sdfTexture,
+static float3 collision_mesh_sdf_local_normal(constant AVBDCollisionMeshSDFSet &meshSDFSet,
+                                              int sdfResourceIndex,
                                               float3 pointLocal,
                                               device const AVBDGPUCollisionMeshInfo &meshInfo) {
     float3 eps = max(meshInfo.sdfVoxelSize.xyz, float3(1.0e-4f));
-    float sdfXPos = sample_collision_mesh_sdf_value(sdfTexture, pointLocal + float3(eps.x, 0.0f, 0.0f), meshInfo);
-    float sdfXNeg = sample_collision_mesh_sdf_value(sdfTexture, pointLocal - float3(eps.x, 0.0f, 0.0f), meshInfo);
-    float sdfYPos = sample_collision_mesh_sdf_value(sdfTexture, pointLocal + float3(0.0f, eps.y, 0.0f), meshInfo);
-    float sdfYNeg = sample_collision_mesh_sdf_value(sdfTexture, pointLocal - float3(0.0f, eps.y, 0.0f), meshInfo);
-    float sdfZPos = sample_collision_mesh_sdf_value(sdfTexture, pointLocal + float3(0.0f, 0.0f, eps.z), meshInfo);
-    float sdfZNeg = sample_collision_mesh_sdf_value(sdfTexture, pointLocal - float3(0.0f, 0.0f, eps.z), meshInfo);
+    float sdfXPos = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal + float3(eps.x, 0.0f, 0.0f), meshInfo);
+    float sdfXNeg = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal - float3(eps.x, 0.0f, 0.0f), meshInfo);
+    float sdfYPos = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal + float3(0.0f, eps.y, 0.0f), meshInfo);
+    float sdfYNeg = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal - float3(0.0f, eps.y, 0.0f), meshInfo);
+    float sdfZPos = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal + float3(0.0f, 0.0f, eps.z), meshInfo);
+    float sdfZNeg = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal - float3(0.0f, 0.0f, eps.z), meshInfo);
 
     if (!isfinite(sdfXPos)) sdfXPos = 1.0f;
     if (!isfinite(sdfXNeg)) sdfXNeg = 1.0f;
@@ -2425,8 +2464,6 @@ kernel void avbd_collide_primitive_mesh_sdf(
                 if (sdfResourceIndex < 0 || sdfResourceIndex >= AVBD_MAX_COLLISION_MESH_SDFS) {
                     validThread = false;
                 } else {
-                    texture3d<float, access::sample> sdfTexture = meshSDFSet.sdf[sdfResourceIndex];
-
                     for (int sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
                         float3 primitivePoint = samplePoints[sampleIndex];
                         float4 worldPoint4 = candidateMeshInfo.sdfInvTransform * float4(primitivePoint, 1.0f);
@@ -2435,12 +2472,12 @@ kernel void avbd_collide_primitive_mesh_sdf(
                             continue;
                         }
 
-                        float signedDistance = sample_collision_mesh_sdf_value(sdfTexture, pointLocal, candidateMeshInfo);
+                        float signedDistance = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndex, pointLocal, candidateMeshInfo);
                         if (!isfinite(signedDistance) || signedDistance >= params.collisionMargin) {
                             continue;
                         }
 
-                        float3 localNormal = collision_mesh_sdf_local_normal(sdfTexture, pointLocal, candidateMeshInfo);
+                        float3 localNormal = collision_mesh_sdf_local_normal(meshSDFSet, sdfResourceIndex, pointLocal, candidateMeshInfo);
                         float3 outwardNormal = collision_mesh_sdf_world_normal(localNormal, candidateMeshInfo);
                         float3 localSurfacePoint = pointLocal - localNormal * signedDistance;
                         float4 worldSurfacePoint4 = candidateMeshInfo.sdfTransform * float4(localSurfacePoint, 1.0f);
