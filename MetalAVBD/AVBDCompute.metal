@@ -654,6 +654,327 @@ static float3 collision_mesh_sdf_world_normal(float3 localNormal,
     return safe_normalize(worldNormal, float3(0.0f, 1.0f, 0.0f));
 }
 
+static float max_component(float3 value) {
+    return max(value.x, max(value.y, value.z));
+}
+
+struct AVBDGPUCollisionMeshVoxelRangeMetal {
+    int3 minCoord;
+    int3 maxCoord;
+    int3 resolution;
+    float3 originLocal;
+    float3 voxelSize;
+    int valid;
+};
+
+static int3 collision_mesh_voxel_resolution(device const AVBDGPUCollisionMeshInfo &meshInfo) {
+    return max(meshInfo.sdfResolution.xyz, int3(1));
+}
+
+static int3 collision_mesh_voxel_range_counts(thread const AVBDGPUCollisionMeshVoxelRangeMetal &range) {
+    if (!range.valid) {
+        return int3(0);
+    }
+    return max(range.maxCoord - range.minCoord + 1, int3(0));
+}
+
+static int collision_mesh_voxel_range_sample_count(thread const AVBDGPUCollisionMeshVoxelRangeMetal &range) {
+    int3 counts = collision_mesh_voxel_range_counts(range);
+    return counts.x * counts.y * counts.z;
+}
+
+static int hydroelastic_voxel_iteration_step(thread const AVBDGPUCollisionMeshVoxelRangeMetal &range,
+                                             int maxSamples) {
+    int3 counts = collision_mesh_voxel_range_counts(range);
+    int safeMaxSamples = max(maxSamples, 1);
+    int step = 1;
+    while ((((counts.x + step - 1) / step) *
+            ((counts.y + step - 1) / step) *
+            ((counts.z + step - 1) / step)) > safeMaxSamples) {
+        step += 1;
+    }
+    return step;
+}
+
+static float3 world_aabb_corner(float3 worldMin, float3 worldMax, int cornerIndex) {
+    return float3(
+        (cornerIndex & 1) != 0 ? worldMax.x : worldMin.x,
+        (cornerIndex & 2) != 0 ? worldMax.y : worldMin.y,
+        (cornerIndex & 4) != 0 ? worldMax.z : worldMin.z
+    );
+}
+
+static float hydroelastic_effective_surface_diff(float sdfA,
+                                                 float sdfB,
+                                                 constant AVBDGPUSolverParams &params) {
+    if (sdfA < 0.0f && sdfB < 0.0f) {
+        return params.hydroelasticInteriorWeight * (sdfA - sdfB);
+    }
+    return sdfA - sdfB;
+}
+
+static bool world_aabb_to_collision_mesh_voxel_range(
+    device const AVBDGPUCollisionMeshInfo &meshInfo,
+    float3 worldMin,
+    float3 worldMax,
+    int padVoxels,
+    thread AVBDGPUCollisionMeshVoxelRangeMetal &outRange)
+{
+    outRange.valid = 0;
+    outRange.resolution = collision_mesh_voxel_resolution(meshInfo);
+    outRange.originLocal = meshInfo.sdfLocalMinBounds.xyz;
+    outRange.voxelSize = max(meshInfo.sdfVoxelSize.xyz, float3(1.0e-5f));
+    outRange.minCoord = int3(0);
+    outRange.maxCoord = int3(-1);
+
+    if (any(worldMin > worldMax)) {
+        return false;
+    }
+
+    float3 boundsMin = float3(FLT_MAX);
+    float3 boundsMax = float3(-FLT_MAX);
+    for (int cornerIndex = 0; cornerIndex < 8; ++cornerIndex) {
+        float3 localCorner = (meshInfo.sdfInvTransform * float4(world_aabb_corner(worldMin, worldMax, cornerIndex), 1.0f)).xyz;
+        boundsMin = min(boundsMin, localCorner);
+        boundsMax = max(boundsMax, localCorner);
+    }
+
+    float3 voxelMinF = floor((boundsMin - outRange.originLocal) / outRange.voxelSize) - float3(float(padVoxels));
+    float3 voxelMaxF = ceil((boundsMax - outRange.originLocal) / outRange.voxelSize) + float3(float(padVoxels));
+
+    int3 voxelMin = clamp(int3(voxelMinF), int3(0), outRange.resolution - 1);
+    int3 voxelMax = clamp(int3(voxelMaxF), int3(0), outRange.resolution - 1);
+    if (any(voxelMin > voxelMax)) {
+        return false;
+    }
+
+    outRange.minCoord = voxelMin;
+    outRange.maxCoord = voxelMax;
+    outRange.valid = 1;
+    return true;
+}
+
+static bool world_aabb_to_collision_mesh_voxel_cell_range(
+    device const AVBDGPUCollisionMeshInfo &meshInfo,
+    float3 worldMin,
+    float3 worldMax,
+    int padVoxels,
+    thread AVBDGPUCollisionMeshVoxelRangeMetal &outRange)
+{
+    if (!world_aabb_to_collision_mesh_voxel_range(meshInfo, worldMin, worldMax, padVoxels, outRange)) {
+        return false;
+    }
+    if (any(outRange.resolution < int3(2))) {
+        outRange.valid = 0;
+        return false;
+    }
+
+    int3 maxCellCoord = outRange.resolution - 2;
+    outRange.minCoord = clamp(outRange.minCoord, int3(0), maxCellCoord);
+    outRange.maxCoord = clamp(outRange.maxCoord - 1, int3(0), maxCellCoord);
+    if (any(outRange.minCoord > outRange.maxCoord)) {
+        outRange.valid = 0;
+        return false;
+    }
+    outRange.valid = 1;
+    return true;
+}
+
+static float3 collision_mesh_voxel_center_local(
+    thread const AVBDGPUCollisionMeshVoxelRangeMetal &range,
+    int3 voxelCoord)
+{
+    return range.originLocal + (float3(voxelCoord) + 0.5f) * range.voxelSize;
+}
+
+[[maybe_unused]] static float3 collision_mesh_voxel_center_world(
+    device const AVBDGPUCollisionMeshInfo &meshInfo,
+    thread const AVBDGPUCollisionMeshVoxelRangeMetal &range,
+    int3 voxelCoord)
+{
+    return (meshInfo.sdfTransform * float4(collision_mesh_voxel_center_local(range, voxelCoord), 1.0f)).xyz;
+}
+
+static float3 collision_mesh_voxel_corner_local(
+    thread const AVBDGPUCollisionMeshVoxelRangeMetal &range,
+    int3 voxelCoord,
+    int cornerIndex)
+{
+    int3 cornerOffset = int3(cornerIndex & 1, (cornerIndex >> 1) & 1, (cornerIndex >> 2) & 1);
+    return range.originLocal + float3(voxelCoord + cornerOffset) * range.voxelSize;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Iso voxel detection and MC centroid extraction
+// ──────────────────────────────────────────────────────────────
+
+// Edge connectivity: 12 edges of a cube, each connecting two corner vertices.
+// Corner ordering: 0=(0,0,0) 1=(1,0,0) 2=(1,1,0) 3=(0,1,0)
+//                  4=(0,0,1) 5=(1,0,1) 6=(1,1,1) 7=(0,1,1)
+constant int mc_edge_corners[12][2] = {
+    {0, 1}, {1, 2}, {2, 3}, {3, 0},   // bottom edges
+    {4, 5}, {5, 6}, {6, 7}, {7, 4},   // top edges
+    {0, 4}, {1, 5}, {2, 6}, {3, 7}    // vertical edges
+};
+
+// Check if a voxel cell contains a zero crossing of the effective surface
+// and if so, return the MC polygon centroid as a world-space sample point.
+static bool evaluate_iso_voxel_and_centroid(
+    constant AVBDCollisionMeshSDFSet &meshSDFSet,
+    device const AVBDGPUCollisionMeshInfo &meshInfoDriver,
+    device const AVBDGPUCollisionMeshInfo &meshInfoOther,
+    thread const AVBDGPUCollisionMeshVoxelRangeMetal &driverRange,
+    int3 voxelCoord,
+    bool driverIsA,
+    float bandWidth,
+    constant AVBDGPUSolverParams &params,
+    thread float3 &outWorldPoint)
+{
+    int sdfResDriver = meshInfoDriver.sdfResourceIndex;
+    int sdfResOther = meshInfoOther.sdfResourceIndex;
+    if (sdfResDriver < 0 || sdfResDriver >= AVBD_MAX_COLLISION_MESH_SDFS ||
+        sdfResOther < 0 || sdfResOther >= AVBD_MAX_COLLISION_MESH_SDFS) {
+        return false;
+    }
+
+    float cornerDiff[8];
+    float3 cornerWorld[8];
+    float minDiff = FLT_MAX, maxDiff = -FLT_MAX;
+    bool nearBand = false;
+
+    for (int c = 0; c < 8; ++c) {
+        float3 localDriver = collision_mesh_voxel_corner_local(driverRange, voxelCoord, c);
+        float3 world = (meshInfoDriver.sdfTransform * float4(localDriver, 1.0f)).xyz;
+        float3 localOther = (meshInfoOther.sdfInvTransform * float4(world, 1.0f)).xyz;
+        if (!point_in_collision_mesh_sdf_bounds(localOther, meshInfoOther)) {
+            return false;
+        }
+
+        float sdfD = sample_collision_mesh_sdf_value(meshSDFSet, sdfResDriver, localDriver, meshInfoDriver);
+        float sdfO = sample_collision_mesh_sdf_value(meshSDFSet, sdfResOther, localOther, meshInfoOther);
+        if (!isfinite(sdfD) || !isfinite(sdfO)) {
+            return false;
+        }
+
+        cornerWorld[c] = world;
+        float effectiveDiff = driverIsA
+            ? hydroelastic_effective_surface_diff(sdfD, sdfO, params)
+            : hydroelastic_effective_surface_diff(sdfO, sdfD, params);
+        cornerDiff[c] = effectiveDiff;
+        minDiff = min(minDiff, effectiveDiff);
+        maxDiff = max(maxDiff, effectiveDiff);
+        nearBand = nearBand || (sdfD <= bandWidth && sdfO <= bandWidth);
+    }
+
+    if (!nearBand || minDiff > 0.0f || maxDiff < 0.0f) {
+        return false;
+    }
+
+    // Find zero-crossing points on edges and compute centroid
+    float3 centroid = float3(0.0f);
+    int crossCount = 0;
+
+    for (int e = 0; e < 12; ++e) {
+        int c0 = mc_edge_corners[e][0];
+        int c1 = mc_edge_corners[e][1];
+        float v0 = cornerDiff[c0];
+        float v1 = cornerDiff[c1];
+        if ((v0 < 0.0f) == (v1 < 0.0f)) {
+            continue;
+        }
+        float t = clamp(v0 / (v0 - v1), 0.0f, 1.0f);
+        centroid += mix(cornerWorld[c0], cornerWorld[c1], t);
+        crossCount++;
+    }
+
+    if (crossCount < 3) {
+        return false;
+    }
+
+    outWorldPoint = centroid / float(crossCount);
+    return true;
+}
+
+static int mesh_mesh_sample_axis_count(float extent, float bandWidth) {
+    return extent > bandWidth * 1.5f ? 3 : 1;
+}
+
+static bool evaluate_mesh_mesh_hydroelastic_sample(
+    constant AVBDCollisionMeshSDFSet &meshSDFSet,
+    device const AVBDGPUCollisionMeshInfo &meshInfoA,
+    device const AVBDGPUCollisionMeshInfo &meshInfoB,
+    float3 worldPoint,
+    bool swapBodyOrder,
+    float bandWidth,
+    constant AVBDGPUSolverParams &params,
+    thread float3 &outXA,
+    thread float3 &outXB,
+    thread float3 &outNormal,
+    thread float3 &outMidpoint,
+    thread float &outSeparation,
+    thread float &outScore)
+{
+    int sdfResourceIndexA = meshInfoA.sdfResourceIndex;
+    int sdfResourceIndexB = meshInfoB.sdfResourceIndex;
+    if (sdfResourceIndexA < 0 || sdfResourceIndexA >= AVBD_MAX_COLLISION_MESH_SDFS ||
+        sdfResourceIndexB < 0 || sdfResourceIndexB >= AVBD_MAX_COLLISION_MESH_SDFS) {
+        return false;
+    }
+
+    float3 pointLocalA = (meshInfoA.sdfInvTransform * float4(worldPoint, 1.0f)).xyz;
+    float3 pointLocalB = (meshInfoB.sdfInvTransform * float4(worldPoint, 1.0f)).xyz;
+    if (!point_in_collision_mesh_sdf_bounds(pointLocalA, meshInfoA) ||
+        !point_in_collision_mesh_sdf_bounds(pointLocalB, meshInfoB)) {
+        return false;
+    }
+
+    float sdfA = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndexA, pointLocalA, meshInfoA);
+    float sdfB = sample_collision_mesh_sdf_value(meshSDFSet, sdfResourceIndexB, pointLocalB, meshInfoB);
+    if (!isfinite(sdfA) || !isfinite(sdfB) || sdfA > bandWidth || sdfB > bandWidth) {
+        return false;
+    }
+
+    float effectiveDiff = hydroelastic_effective_surface_diff(sdfA, sdfB, params);
+    if (abs(effectiveDiff) > bandWidth) {
+        return false;
+    }
+
+    float3 localNormalA = collision_mesh_sdf_local_normal(meshSDFSet, sdfResourceIndexA, pointLocalA, meshInfoA);
+    float3 localNormalB = collision_mesh_sdf_local_normal(meshSDFSet, sdfResourceIndexB, pointLocalB, meshInfoB);
+    float3 worldNormalA = collision_mesh_sdf_world_normal(localNormalA, meshInfoA);
+    float3 worldNormalB = collision_mesh_sdf_world_normal(localNormalB, meshInfoB);
+
+    float3 surfacePointA = (meshInfoA.sdfTransform * float4(pointLocalA - localNormalA * sdfA, 1.0f)).xyz;
+    float3 surfacePointB = (meshInfoB.sdfTransform * float4(pointLocalB - localNormalB * sdfB, 1.0f)).xyz;
+    float3 normalAB = safe_normalize(worldNormalB - worldNormalA, worldNormalB);
+
+    float3 xA = surfacePointA;
+    float3 xB = surfacePointB;
+    float3 normal = normalAB;
+    if (swapBodyOrder) {
+        xA = surfacePointB;
+        xB = surfacePointA;
+        normal = -normalAB;
+    }
+
+    float separation = dot(normal, xA - xB);
+    if (separation > bandWidth) {
+        return false;
+    }
+
+    float penetration = max(-separation, 0.0f);
+    float depthBias = max(-min(sdfA, sdfB), 0.0f);
+    float closeness = max(bandWidth - abs(effectiveDiff), 0.0f);
+
+    outXA = xA;
+    outXB = xB;
+    outNormal = normal;
+    outMidpoint = 0.5f * (xA + xB);
+    outSeparation = separation;
+    outScore = penetration + depthBias * 0.25f + closeness * 0.05f;
+    return outScore > 0.0f || separation <= bandWidth * 0.25f;
+}
+
 static void get_face_axes(thread const AVBDGPUOBBMetal &box,
                           int axisIndex,
                           thread float3 &u,
@@ -2066,7 +2387,8 @@ kernel void avbd_broadphase_primitive_mesh(
     device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(1)]],
     device AVBDGPUPrimitiveMeshPair *candidatePairs [[buffer(2)]],
     device AVBDGPUPrimitiveMeshPairListState *candidateState [[buffer(3)]],
-    constant AVBDGPUSolverParams &params [[buffer(4)]],
+    device const int *meshOwnerBodyMask [[buffer(4)]],
+    constant AVBDGPUSolverParams &params [[buffer(5)]],
     uint tid [[thread_position_in_grid]])
 {
     int bodyCount = params.bodyCount;
@@ -2076,6 +2398,10 @@ kernel void avbd_broadphase_primitive_mesh(
 
     int bodyIndex = int(tid) / meshCount;
     int meshIndex = int(tid) - bodyIndex * meshCount;
+
+    if (meshOwnerBodyMask[bodyIndex] != 0) {
+        return;
+    }
 
     if (meshInfos[meshIndex].ownerBodyIndex == bodyIndex) {
         return;
@@ -2123,19 +2449,27 @@ kernel void avbd_broadphase_mesh_mesh(
     uint tid [[thread_position_in_grid]])
 {
     int meshCount = params.meshCount;
-    int pairCount = meshCount * meshCount;
+    int pairCount = meshCount * (meshCount - 1) / 2;
     if (tid >= uint(pairCount) || meshCount <= 1) return;
 
-    int meshIndexA = int(tid) / meshCount;
-    int meshIndexB = int(tid) - meshIndexA * meshCount;
-    if (meshIndexA >= meshIndexB) {
+    int meshIndexA = -1;
+    int meshIndexB = -1;
+    upper_triangle_pair(tid, meshCount, meshIndexA, meshIndexB);
+    if (meshIndexA < 0 || meshIndexB < 0) return;
+
+    int ownerBodyIndexA = meshInfos[meshIndexA].ownerBodyIndex;
+    int ownerBodyIndexB = meshInfos[meshIndexB].ownerBodyIndex;
+    if ((ownerBodyIndexA >= 0 && ownerBodyIndexA == ownerBodyIndexB) ||
+        (ownerBodyIndexA < 0 && ownerBodyIndexB < 0)) {
         return;
     }
 
-    float3 minA = meshInfos[meshIndexA].minBounds.xyz;
-    float3 maxA = meshInfos[meshIndexA].maxBounds.xyz;
-    float3 minB = meshInfos[meshIndexB].minBounds.xyz;
-    float3 maxB = meshInfos[meshIndexB].maxBounds.xyz;
+    float expandA = params.cacheMargin + params.collisionMargin + max_component(meshInfos[meshIndexA].sdfVoxelSize.xyz);
+    float expandB = params.cacheMargin + params.collisionMargin + max_component(meshInfos[meshIndexB].sdfVoxelSize.xyz);
+    float3 minA = meshInfos[meshIndexA].minBounds.xyz - float3(expandA);
+    float3 maxA = meshInfos[meshIndexA].maxBounds.xyz + float3(expandA);
+    float3 minB = meshInfos[meshIndexB].minBounds.xyz - float3(expandB);
+    float3 maxB = meshInfos[meshIndexB].maxBounds.xyz + float3(expandB);
     if (!aabb_overlaps(minA, maxA, minB, maxB)) {
         return;
     }
@@ -2165,27 +2499,452 @@ kernel void avbd_prepare_mesh_mesh_collision_indirect(
 }
 
 kernel void avbd_collide_mesh_mesh(
-    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(0)]],
-    device const AVBDGPUMeshMeshPair *candidatePairs [[buffer(1)]],
-    device AVBDGPUMeshMeshPairListState *candidateState [[buffer(2)]],
-    constant AVBDGPUSolverParams &params [[buffer(3)]],
-    uint tid [[thread_position_in_grid]])
+    device const AVBDGPUBody *bodies [[buffer(0)]],
+    device const AVBDGPUCollisionMeshInfo *meshInfos [[buffer(1)]],
+    device const AVBDGPUMeshMeshPair *candidatePairs [[buffer(2)]],
+    device AVBDGPUMeshMeshPairListState *candidateState [[buffer(3)]],
+    constant AVBDGPUSolverParams &params [[buffer(4)]],
+    device AVBDGPUManifold *manifolds [[buffer(5)]],
+    device AVBDGPUContact *allContacts [[buffer(6)]],
+    device AVBDGPUContactAllocator *contactAllocator [[buffer(7)]],
+    device int *activeManifoldIndices [[buffer(8)]],
+    device AVBDGPUActiveManifoldListState *activeManifoldState [[buffer(9)]],
+    constant AVBDCollisionMeshSDFSet &meshSDFSet [[buffer(10)]],
+    device AVBDGPUMeshMeshIsoVoxelDebug *isoVoxelDebugEntries [[buffer(11)]],
+    device AVBDGPUMeshMeshIsoVoxelCoord *isoVoxelCoords [[buffer(12)]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tid [[thread_position_in_grid]],
+    uint simd_size [[threads_per_simdgroup]])
 {
     int candidateCount = min(atomic_load_explicit(&candidateState[0].count, memory_order_relaxed), candidateState[0].capacity);
-    if (tid >= uint(candidateCount)) return;
+    bool trackIsoVoxelDebug = tid < uint(max(params.meshMeshIsoVoxelTrackedPairCapacity, 0));
+    if (trackIsoVoxelDebug) {
+        isoVoxelDebugEntries[tid].meshIndexA = -1;
+        isoVoxelDebugEntries[tid].meshIndexB = -1;
+        isoVoxelDebugEntries[tid].driverMeshIndex = -1;
+        isoVoxelDebugEntries[tid].sampledVoxelCount = 0;
+        isoVoxelDebugEntries[tid].candidateVoxelCount = 0;
+        isoVoxelDebugEntries[tid].compactedVoxelCount = 0;
+        isoVoxelDebugEntries[tid].sampleStride = 0;
+        isoVoxelDebugEntries[tid].overflowed = 0;
+        isoVoxelDebugEntries[tid].valid = 0;
+    }
+    bool validThread = tid < uint(candidateCount);
 
-    const device AVBDGPUMeshMeshPair &pair = candidatePairs[tid];
-    if (pair.meshIndexA < 0 || pair.meshIndexA >= params.meshCount ||
-        pair.meshIndexB < 0 || pair.meshIndexB >= params.meshCount) {
-        return;
+    int manifoldSlot = -1;
+    AVBDGPUContactBuilderMetal builder;
+    builder.count = 0;
+    Mat3 basis = Mat3::identity();
+
+    if (validThread) {
+        const device AVBDGPUMeshMeshPair &pair = candidatePairs[tid];
+        if (trackIsoVoxelDebug) {
+            isoVoxelDebugEntries[tid].meshIndexA = pair.meshIndexA;
+            isoVoxelDebugEntries[tid].meshIndexB = pair.meshIndexB;
+        }
+        if (pair.meshIndexA < 0 || pair.meshIndexA >= params.meshCount ||
+            pair.meshIndexB < 0 || pair.meshIndexB >= params.meshCount) {
+            validThread = false;
+        }
     }
 
-    float3 minA = meshInfos[pair.meshIndexA].minBounds.xyz;
-    float3 maxA = meshInfos[pair.meshIndexA].maxBounds.xyz;
-    float3 minB = meshInfos[pair.meshIndexB].minBounds.xyz;
-    float3 maxB = meshInfos[pair.meshIndexB].maxBounds.xyz;
-    if (!aabb_overlaps(minA, maxA, minB, maxB)) {
-        return;
+    if (validThread) {
+        const device AVBDGPUMeshMeshPair &pair = candidatePairs[tid];
+        const device AVBDGPUCollisionMeshInfo &meshInfoA = meshInfos[pair.meshIndexA];
+        const device AVBDGPUCollisionMeshInfo &meshInfoB = meshInfos[pair.meshIndexB];
+
+        float3 overlapMin = max(meshInfoA.minBounds.xyz, meshInfoB.minBounds.xyz);
+        float3 overlapMax = min(meshInfoA.maxBounds.xyz, meshInfoB.maxBounds.xyz);
+        if (any(overlapMin >= overlapMax)) {
+            validThread = false;
+        }
+
+        int ownerBodyIndexA = meshInfoA.ownerBodyIndex;
+        int ownerBodyIndexB = meshInfoB.ownerBodyIndex;
+        if ((ownerBodyIndexA >= 0 && ownerBodyIndexA == ownerBodyIndexB) ||
+            (ownerBodyIndexA < 0 && ownerBodyIndexB < 0)) {
+            validThread = false;
+        }
+        if ((ownerBodyIndexA >= params.bodyCount) || (ownerBodyIndexB >= params.bodyCount)) {
+            validThread = false;
+        }
+
+        bool swapBodyOrder = ownerBodyIndexA < 0 && ownerBodyIndexB >= 0;
+        bool bodyAIsDynamicMesh = !swapBodyOrder;
+        int dynamicBodyIndex = bodyAIsDynamicMesh ? ownerBodyIndexA : ownerBodyIndexB;
+        int otherBodyIndex = bodyAIsDynamicMesh ? ownerBodyIndexB : ownerBodyIndexA;
+        int staticMeshIndex = bodyAIsDynamicMesh ? pair.meshIndexB : pair.meshIndexA;
+
+        manifoldSlot = params.meshMeshManifoldOffset + int(tid);
+        device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+        manifold.bodyA = dynamicBodyIndex;
+        manifold.bodyB = otherBodyIndex >= 0 ? otherBodyIndex : -(staticMeshIndex + 1);
+        manifold.contactCount = 0;
+        manifold.contactBaseIndex = -1;
+        manifold.active = 0;
+        manifold.friction = 0.5f;
+        manifold.basisR0 = float3(1, 0, 0);
+        manifold.basisR1 = float3(0, 1, 0);
+        manifold.basisR2 = float3(0, 0, 1);
+
+        if (validThread && dynamicBodyIndex >= 0) {
+            if (otherBodyIndex >= 0) {
+                manifold.friction = 0.5f * (bodies[dynamicBodyIndex].friction + bodies[otherBodyIndex].friction);
+            } else {
+                manifold.friction = bodies[dynamicBodyIndex].friction;
+            }
+        } else {
+            validThread = false;
+        }
+
+        if (validThread) {
+            // ── Iso voxel-driven single-pass contact generation ──
+            int maxIsoSamples = max(8, min(params.meshMeshMaxIsoVoxelSamples, 4096));
+            bool reduceContacts = params.meshMeshReduceContacts != 0;
+            float voxelBand = max(max_component(meshInfoA.sdfVoxelSize.xyz), max_component(meshInfoB.sdfVoxelSize.xyz));
+            float bandWidth = max(params.collisionMargin * 2.0f + voxelBand, voxelBand * 2.5f);
+
+            AVBDGPUCollisionMeshVoxelRangeMetal cellRangeA;
+            AVBDGPUCollisionMeshVoxelRangeMetal cellRangeB;
+            bool hasCellRangeA = world_aabb_to_collision_mesh_voxel_cell_range(meshInfoA, overlapMin, overlapMax, 1, cellRangeA);
+            bool hasCellRangeB = world_aabb_to_collision_mesh_voxel_cell_range(meshInfoB, overlapMin, overlapMax, 1, cellRangeB);
+
+            bool usedIsoVoxelPath = false;
+
+            if (hasCellRangeA && hasCellRangeB) {
+                int cellCountA = collision_mesh_voxel_range_sample_count(cellRangeA);
+                int cellCountB = collision_mesh_voxel_range_sample_count(cellRangeB);
+                bool driveFromA = cellCountA <= cellCountB;
+                AVBDGPUCollisionMeshVoxelRangeMetal driverRange = driveFromA ? cellRangeA : cellRangeB;
+                int3 driverCounts = collision_mesh_voxel_range_counts(driverRange);
+                int sampleStride = hydroelastic_voxel_iteration_step(driverRange, maxIsoSamples);
+                int sampleCountVX = max((driverCounts.x + sampleStride - 1) / sampleStride, 1);
+                int sampleCountVY = max((driverCounts.y + sampleStride - 1) / sampleStride, 1);
+                int sampleCountVZ = max((driverCounts.z + sampleStride - 1) / sampleStride, 1);
+
+                // Debug tracking
+                int sampledVoxelCount = 0;
+                int candidateVoxelCount = 0;
+                int compactedVoxelCount = 0;
+                int debugOverflowed = 0;
+                int coordBaseOffset = trackIsoVoxelDebug ? int(tid) * params.meshMeshIsoVoxelCoordsPerPair : 0;
+
+                // Single-pass: use overlap geometry for stable basis, bin into quadrants
+                float bestOverallScore = -FLT_MAX;
+                float3 bestOverallNormal = float3(0.0f, 1.0f, 0.0f);
+                float3 basisCenter = 0.5f * (overlapMin + overlapMax);
+
+                // Build stable basis from overlap AABB: shortest axis ~ contact normal
+                {
+                    float3 overlapExtent = overlapMax - overlapMin;
+                    int shortAxis = 0;
+                    if (overlapExtent.y < overlapExtent.x && overlapExtent.y < overlapExtent.z) shortAxis = 1;
+                    else if (overlapExtent.z < overlapExtent.x) shortAxis = 2;
+                    float3 axisDir = float3(shortAxis == 0 ? 1.0f : 0.0f,
+                                            shortAxis == 1 ? 1.0f : 0.0f,
+                                            shortAxis == 2 ? 1.0f : 0.0f);
+                    basis = orthonormal_basis(axisDir);
+                }
+
+                float quadScore[AVBD_MAX_CONTACTS_PER_PAIR];
+                float3 quadXA[AVBD_MAX_CONTACTS_PER_PAIR];
+                float3 quadXB[AVBD_MAX_CONTACTS_PER_PAIR];
+                for (int qi = 0; qi < AVBD_MAX_CONTACTS_PER_PAIR; ++qi) {
+                    quadScore[qi] = -FLT_MAX;
+                }
+
+                for (int vz = 0; vz < sampleCountVZ; ++vz) {
+                    for (int vy = 0; vy < sampleCountVY; ++vy) {
+                        for (int vx = 0; vx < sampleCountVX; ++vx) {
+                            int3 voxelOffset = int3(
+                                min(vx * sampleStride, driverCounts.x - 1),
+                                min(vy * sampleStride, driverCounts.y - 1),
+                                min(vz * sampleStride, driverCounts.z - 1)
+                            );
+                            int3 voxelCoord = driverRange.minCoord + voxelOffset;
+                            sampledVoxelCount += 1;
+
+                            float3 worldPoint;
+                            if (!evaluate_iso_voxel_and_centroid(
+                                    meshSDFSet,
+                                    driveFromA ? meshInfoA : meshInfoB,
+                                    driveFromA ? meshInfoB : meshInfoA,
+                                    driverRange,
+                                    voxelCoord,
+                                    driveFromA,
+                                    bandWidth,
+                                    params,
+                                    worldPoint)) {
+                                continue;
+                            }
+
+                            candidateVoxelCount += 1;
+
+                            if (trackIsoVoxelDebug) {
+                                if (compactedVoxelCount < params.meshMeshIsoVoxelCoordsPerPair) {
+                                    isoVoxelCoords[coordBaseOffset + compactedVoxelCount].voxelCoord = int4(voxelCoord, 0);
+                                    compactedVoxelCount += 1;
+                                } else {
+                                    debugOverflowed = 1;
+                                }
+                            }
+
+                            float3 xA, xB, normal, midpoint;
+                            float separation, score;
+                            if (!evaluate_mesh_mesh_hydroelastic_sample(
+                                    meshSDFSet, meshInfoA, meshInfoB, worldPoint,
+                                    swapBodyOrder, bandWidth, params,
+                                    xA, xB, normal, midpoint, separation, score)) {
+                                continue;
+                            }
+
+                            if (score > bestOverallScore) {
+                                bestOverallScore = score;
+                                bestOverallNormal = normal;
+                            }
+
+                            if (reduceContacts) {
+                                // Quadrant binning
+                                float2 tangentOffset = float2(
+                                    dot(basis.r1, midpoint - basisCenter),
+                                    dot(basis.r2, midpoint - basisCenter)
+                                );
+                                int quadrant = (tangentOffset.x >= 0.0f ? 1 : 0) | (tangentOffset.y >= 0.0f ? 2 : 0);
+                                float quadrantScore = score + max(-separation, 0.0f) * 0.5f;
+                                if (quadrantScore > quadScore[quadrant]) {
+                                    quadScore[quadrant] = quadrantScore;
+                                    quadXA[quadrant] = xA;
+                                    quadXB[quadrant] = xB;
+                                }
+                            } else {
+                                // No reduction: emit directly (up to contact limit)
+                                if (builder.count < AVBD_MAX_CONTACTS_PER_PAIR) {
+                                    if (otherBodyIndex >= 0) {
+                                        append_primitive_mesh_contact(
+                                            builder, bodies[dynamicBodyIndex], bodies[otherBodyIndex],
+                                            xA, xB,
+                                            primitive_mesh_feature_key(pair.meshIndexA ^ pair.meshIndexB, builder.count, int(tid))
+                                        );
+                                    } else {
+                                        append_mesh_contact(
+                                            builder, bodies[dynamicBodyIndex], xA, xB,
+                                            primitive_mesh_feature_key(staticMeshIndex, builder.count, int(tid))
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Write debug info
+                if (trackIsoVoxelDebug) {
+                    isoVoxelDebugEntries[tid].driverMeshIndex = driveFromA ? pair.meshIndexA : pair.meshIndexB;
+                    isoVoxelDebugEntries[tid].sampledVoxelCount = sampledVoxelCount;
+                    isoVoxelDebugEntries[tid].candidateVoxelCount = candidateVoxelCount;
+                    isoVoxelDebugEntries[tid].compactedVoxelCount = compactedVoxelCount;
+                    isoVoxelDebugEntries[tid].sampleStride = sampleStride;
+                    isoVoxelDebugEntries[tid].overflowed = debugOverflowed;
+                    isoVoxelDebugEntries[tid].valid = 1;
+                }
+
+                // Emit reduced contacts
+                if (reduceContacts && bestOverallScore > -FLT_MAX) {
+                    usedIsoVoxelPath = true;
+                    // Use best contact normal for the solver basis
+                    basis = orthonormal_basis(bestOverallNormal);
+                    if (otherBodyIndex >= 0) {
+                        for (int quadrant = 0; quadrant < AVBD_MAX_CONTACTS_PER_PAIR; ++quadrant) {
+                            if (quadScore[quadrant] <= -FLT_MAX) continue;
+                            append_primitive_mesh_contact(
+                                builder, bodies[dynamicBodyIndex], bodies[otherBodyIndex],
+                                quadXA[quadrant], quadXB[quadrant],
+                                primitive_mesh_feature_key(pair.meshIndexA ^ pair.meshIndexB, quadrant, int(tid))
+                            );
+                        }
+                    } else {
+                        for (int quadrant = 0; quadrant < AVBD_MAX_CONTACTS_PER_PAIR; ++quadrant) {
+                            if (quadScore[quadrant] <= -FLT_MAX) continue;
+                            append_mesh_contact(
+                                builder, bodies[dynamicBodyIndex],
+                                quadXA[quadrant], quadXB[quadrant],
+                                primitive_mesh_feature_key(staticMeshIndex, quadrant, int(tid))
+                            );
+                        }
+                    }
+                } else if (!reduceContacts && builder.count > 0) {
+                    usedIsoVoxelPath = true;
+                }
+            }
+
+            // Fallback: grid sampling when iso voxel path produces nothing
+            if (!usedIsoVoxelPath) {
+                float3 overlapExtent = overlapMax - overlapMin;
+                int sampleCountX = mesh_mesh_sample_axis_count(overlapExtent.x, bandWidth);
+                int sampleCountY = mesh_mesh_sample_axis_count(overlapExtent.y, bandWidth);
+                int sampleCountZ = mesh_mesh_sample_axis_count(overlapExtent.z, bandWidth);
+                float3 sampleCountF = float3(float(sampleCountX), float(sampleCountY), float(sampleCountZ));
+
+                float bestScore = -FLT_MAX;
+                float3 bestNormal = float3(0.0f, 1.0f, 0.0f);
+                float3 bestMidpoint = 0.5f * (overlapMin + overlapMax);
+                float bestSeparation = FLT_MAX;
+
+                for (int z = 0; z < sampleCountZ; ++z) {
+                    for (int y = 0; y < sampleCountY; ++y) {
+                        for (int x = 0; x < sampleCountX; ++x) {
+                            float3 uv = (float3(float(x), float(y), float(z)) + 0.5f) / sampleCountF;
+                            float3 worldPoint = mix(overlapMin, overlapMax, uv);
+                            float3 xA, xB, normal, midpoint;
+                            float separation, score;
+                            if (!evaluate_mesh_mesh_hydroelastic_sample(
+                                    meshSDFSet, meshInfoA, meshInfoB, worldPoint,
+                                    swapBodyOrder, bandWidth, params,
+                                    xA, xB, normal, midpoint, separation, score)) {
+                                continue;
+                            }
+                            if (score > bestScore || (score == bestScore && separation < bestSeparation)) {
+                                bestScore = score;
+                                bestNormal = normal;
+                                bestMidpoint = midpoint;
+                                bestSeparation = separation;
+                            }
+                        }
+                    }
+                }
+
+                if (bestScore > -FLT_MAX) {
+                    basis = orthonormal_basis(bestNormal);
+                    float fbQuadrantScore[AVBD_MAX_CONTACTS_PER_PAIR];
+                    float3 fbQuadrantXA[AVBD_MAX_CONTACTS_PER_PAIR];
+                    float3 fbQuadrantXB[AVBD_MAX_CONTACTS_PER_PAIR];
+                    for (int qi = 0; qi < AVBD_MAX_CONTACTS_PER_PAIR; ++qi) {
+                        fbQuadrantScore[qi] = -FLT_MAX;
+                        fbQuadrantXA[qi] = float3(0.0f);
+                        fbQuadrantXB[qi] = float3(0.0f);
+                    }
+                    for (int z = 0; z < sampleCountZ; ++z) {
+                        for (int y = 0; y < sampleCountY; ++y) {
+                            for (int x = 0; x < sampleCountX; ++x) {
+                                float3 uv = (float3(float(x), float(y), float(z)) + 0.5f) / sampleCountF;
+                                float3 worldPoint = mix(overlapMin, overlapMax, uv);
+                                float3 xA, xB, normal, midpoint;
+                                float separation, score;
+                                if (!evaluate_mesh_mesh_hydroelastic_sample(
+                                        meshSDFSet, meshInfoA, meshInfoB, worldPoint,
+                                        swapBodyOrder, bandWidth, params,
+                                        xA, xB, normal, midpoint, separation, score)) {
+                                    continue;
+                                }
+                                float2 tangentOffset = float2(
+                                    dot(basis.r1, midpoint - bestMidpoint),
+                                    dot(basis.r2, midpoint - bestMidpoint)
+                                );
+                                int quadrant = (tangentOffset.x >= 0.0f ? 1 : 0) | (tangentOffset.y >= 0.0f ? 2 : 0);
+                                float quadrantScore = score + max(-separation, 0.0f) * 0.5f;
+                                if (quadrantScore > fbQuadrantScore[quadrant]) {
+                                    fbQuadrantScore[quadrant] = quadrantScore;
+                                    fbQuadrantXA[quadrant] = xA;
+                                    fbQuadrantXB[quadrant] = xB;
+                                }
+                            }
+                        }
+                    }
+                    if (otherBodyIndex >= 0) {
+                        for (int quadrant = 0; quadrant < AVBD_MAX_CONTACTS_PER_PAIR; ++quadrant) {
+                            if (fbQuadrantScore[quadrant] <= -FLT_MAX) continue;
+                            append_primitive_mesh_contact(
+                                builder, bodies[dynamicBodyIndex], bodies[otherBodyIndex],
+                                fbQuadrantXA[quadrant], fbQuadrantXB[quadrant],
+                                primitive_mesh_feature_key(pair.meshIndexA ^ pair.meshIndexB, quadrant, int(tid))
+                            );
+                        }
+                    } else {
+                        for (int quadrant = 0; quadrant < AVBD_MAX_CONTACTS_PER_PAIR; ++quadrant) {
+                            if (fbQuadrantScore[quadrant] <= -FLT_MAX) continue;
+                            append_mesh_contact(
+                                builder, bodies[dynamicBodyIndex],
+                                fbQuadrantXA[quadrant], fbQuadrantXB[quadrant],
+                                primitive_mesh_feature_key(staticMeshIndex, quadrant, int(tid))
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Write final debug counters
+            if (trackIsoVoxelDebug) {
+                isoVoxelDebugEntries[tid].emittedContactCount = builder.count;
+                isoVoxelDebugEntries[tid].usedIsoVoxelPath = usedIsoVoxelPath ? 1 : 0;
+            }
+
+            if (builder.count > 0) {
+                if (otherBodyIndex >= 0) {
+                    finalize_builder_contacts(
+                        bodies[dynamicBodyIndex],
+                        bodies[otherBodyIndex],
+                        builder,
+                        basis,
+                        params.collisionMargin
+                    );
+                    manifold.bodyB = otherBodyIndex;
+                    manifold.friction = 0.5f * (bodies[dynamicBodyIndex].friction + bodies[otherBodyIndex].friction);
+                } else {
+                    finalize_builder_mesh_contacts(
+                        bodies[dynamicBodyIndex],
+                        builder,
+                        basis,
+                        params.collisionMargin
+                    );
+                    manifold.bodyB = -(staticMeshIndex + 1);
+                    manifold.friction = bodies[dynamicBodyIndex].friction;
+                }
+                manifold.basisR0 = basis.r0;
+                manifold.basisR1 = basis.r1;
+                manifold.basisR2 = basis.r2;
+            }
+        }
+    }
+
+    int myContactOffset = simd_prefix_exclusive_sum(builder.count);
+    int totalContacts = simd_broadcast(myContactOffset + builder.count, simd_size - 1);
+
+    int contactBatchBaseIndex = 0;
+    int contactBatchGrantedCount = 0;
+    if (lid == 0 && totalContacts > 0) {
+        contactBatchGrantedCount = reserve_contact_range(contactAllocator[0], totalContacts, contactBatchBaseIndex);
+    }
+    contactBatchBaseIndex = simd_broadcast(contactBatchBaseIndex, 0);
+    contactBatchGrantedCount = simd_broadcast(contactBatchGrantedCount, 0);
+
+    bool shouldEmitActiveManifold = false;
+    if (validThread && manifoldSlot >= 0 && builder.count > 0) {
+        int myGrantedContacts = min(builder.count, max(contactBatchGrantedCount - myContactOffset, 0));
+        if (myGrantedContacts > 0) {
+            device AVBDGPUManifold &manifold = manifolds[manifoldSlot];
+            manifold.contactBaseIndex = contactBatchBaseIndex + myContactOffset;
+            manifold.contactCount = myGrantedContacts;
+            manifold.active = 1;
+            shouldEmitActiveManifold = true;
+            for (int i = 0; i < myGrantedContacts; ++i) {
+                allContacts[manifold.contactBaseIndex + i] = builder.contacts[i];
+            }
+        }
+    }
+
+    int myActiveRank = simd_prefix_exclusive_sum(shouldEmitActiveManifold ? 1 : 0);
+    int totalActive = simd_broadcast(myActiveRank + (shouldEmitActiveManifold ? 1 : 0), simd_size - 1);
+
+    int activeManifoldBaseIndex = 0;
+    int activeManifoldGrantedCount = 0;
+    if (lid == 0 && totalActive > 0) {
+        activeManifoldGrantedCount = reserve_active_manifold_range(activeManifoldState[0], totalActive, activeManifoldBaseIndex);
+    }
+    activeManifoldBaseIndex = simd_broadcast(activeManifoldBaseIndex, 0);
+    activeManifoldGrantedCount = simd_broadcast(activeManifoldGrantedCount, 0);
+
+    if (shouldEmitActiveManifold && myActiveRank < activeManifoldGrantedCount) {
+        activeManifoldIndices[activeManifoldBaseIndex + myActiveRank] = manifoldSlot;
     }
 }
 

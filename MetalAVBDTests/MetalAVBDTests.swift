@@ -112,6 +112,174 @@ struct MetalAVBDTests {
         #expect(stats.nearSurfaceMaxAbsoluteError <= 0.08)
     }
 
+    @Test func meshMeshCubeSettlesOnStaticFloor() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let scene = makeMeshOnlyScene(dynamicBodyPositions: [SIMD3<Float>(0, 0, 1.6)])
+        let gpuSolver = try #require(AVBDGPUSolver(device: device, scene: scene))
+        gpuSolver.dt = 1.0 / 120.0
+        gpuSolver.gravity = -9.8
+        gpuSolver.iterations = 16
+        gpuSolver.enablePrimitiveMeshCollisions = false
+        gpuSolver.enableMeshMeshCollisions = true
+
+        let instanceBuffer = try makeInstanceBuffer(device: device, bodyCount: scene.bodies.count)
+        let result = try runMeshOnlySimulation(
+            gpuSolver: gpuSolver,
+            queue: queue,
+            instanceBuffer: instanceBuffer,
+            initialDynamicBodies: scene.bodies,
+            stepCount: 90
+        )
+
+        let finalBody = try #require(result.finalBodies.first)
+        #expect(abs(finalBody.positionLin.z) >= 0.38)
+        #expect(finalBody.positionLin.z <= 1.20)
+        #expect(abs(finalBody.velocityLin.z) <= 5.00)
+        #expect(result.maxLateralDrift <= 0.60)
+    }
+
+    @Test func meshMeshCubeStackPreservesVerticalOrder() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let scene = makeMeshOnlyScene(
+            dynamicBodyPositions: [
+                SIMD3<Float>(0, 0, 0.75),
+                SIMD3<Float>(0, 0, 1.85),
+            ]
+        )
+        let gpuSolver = try #require(AVBDGPUSolver(device: device, scene: scene))
+        gpuSolver.dt = 1.0 / 120.0
+        gpuSolver.gravity = -9.8
+        gpuSolver.iterations = 18
+        gpuSolver.enablePrimitiveMeshCollisions = false
+        gpuSolver.enableMeshMeshCollisions = true
+
+        let instanceBuffer = try makeInstanceBuffer(device: device, bodyCount: scene.bodies.count)
+        let result = try runMeshOnlySimulation(
+            gpuSolver: gpuSolver,
+            queue: queue,
+            instanceBuffer: instanceBuffer,
+            initialDynamicBodies: scene.bodies,
+            stepCount: 120
+        )
+
+        #expect(result.finalBodies.count == 2)
+        let lower = result.finalBodies[0]
+        let upper = result.finalBodies[1]
+        #expect(lower.positionLin.z >= 0.30)
+        #expect(upper.positionLin.z >= lower.positionLin.z + 0.65)
+        #expect(abs(upper.positionLin.x - lower.positionLin.x) <= 1.10)
+        #expect(abs(upper.positionLin.y - lower.positionLin.y) <= 1.10)
+        #expect(result.maxLateralDrift <= 1.10)
+        #expect(result.minVerticalGap >= 0.55)
+    }
+
+    @Test func meshMeshIsoVoxelDebugProducesCandidatesForOverlappingMeshes() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let scene = makeMeshOnlyScene(dynamicBodyPositions: [SIMD3<Float>(0, 0, 0.4)])
+        let gpuSolver = try #require(AVBDGPUSolver(device: device, scene: scene))
+        gpuSolver.dt = 1.0 / 120.0
+        gpuSolver.gravity = 0.0
+        gpuSolver.iterations = 1
+        gpuSolver.enablePrimitiveMeshCollisions = false
+        gpuSolver.enableMeshMeshCollisions = true
+
+        let collisionMeshes = makeMeshOnlyCollisionMeshes(dynamicBodies: scene.bodies)
+        gpuSolver.setCollisionMeshes(collisionMeshes)
+
+        let instanceBuffer = try makeInstanceBuffer(device: device, bodyCount: scene.bodies.count)
+        try runStep(gpuSolver: gpuSolver, queue: queue, instanceBuffer: instanceBuffer)
+
+        let entries = gpuSolver.readMeshMeshIsoVoxelDebugEntries()
+        #expect(!entries.isEmpty)
+        #expect(entries.contains { $0.sampledVoxelCount > 0 })
+        #expect(entries.contains { $0.candidateVoxelCount > 0 })
+        #expect(entries.contains { $0.compactedVoxelCount > 0 })
+        #expect(entries.allSatisfy { $0.compactedVoxelCount <= $0.candidateVoxelCount })
+        #expect(entries.allSatisfy { $0.sampleStride >= 1 })
+        #expect(entries.contains { !$0.voxelCoords.isEmpty })
+        #expect(entries.allSatisfy { $0.voxelCoords.count == $0.compactedVoxelCount })
+    }
+
+    @Test func meshMeshCubeOnCubePreservesVerticalSeparation() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let scene = AVBDScene(
+            id: .empty,
+            name: "Cube on Cube",
+            bodies: [
+                AVBDRigidBody(
+                    renderShape: .box,
+                    size: SIMD3<Float>(1, 1, 1),
+                    density: 1.0,
+                    friction: 0.8,
+                    position: SIMD3<Float>(0, 0, 0.75),
+                    orientation: simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1)),
+                    velocity: .zero,
+                    renderColor: nil,
+                    colorGroup: nil
+                ),
+                AVBDRigidBody(
+                    renderShape: .box,
+                    size: SIMD3<Float>(1, 1, 1),
+                    density: 1.0,
+                    friction: 0.8,
+                    position: SIMD3<Float>(0, 0, 1.85),
+                    orientation: simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1)),
+                    velocity: .zero,
+                    renderColor: nil,
+                    colorGroup: nil
+                ),
+            ],
+            constraints: []
+        )
+        let gpuSolver = try #require(AVBDGPUSolver(device: device, scene: scene))
+        gpuSolver.dt = 1.0 / 120.0
+        gpuSolver.gravity = -9.8
+        gpuSolver.iterations = 18
+        gpuSolver.enablePrimitiveMeshCollisions = false
+        gpuSolver.enableMeshMeshCollisions = true
+
+        let instanceBuffer = try makeInstanceBuffer(device: device, bodyCount: scene.bodies.count)
+        let result = try runMeshOnlySimulation(
+            gpuSolver: gpuSolver,
+            queue: queue,
+            instanceBuffer: instanceBuffer,
+            initialDynamicBodies: scene.bodies,
+            stepCount: 120
+        )
+
+        #expect(result.finalBodies.count == 2)
+        let lower = result.finalBodies.min { $0.positionLin.z < $1.positionLin.z }!
+        let upper = result.finalBodies.max { $0.positionLin.z < $1.positionLin.z }!
+        #expect(upper.positionLin.z > lower.positionLin.z + 0.5)
+    }
+
+    @Test func meshMeshIsoVoxelDebugReportsContactCount() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let scene = makeMeshOnlyScene(dynamicBodyPositions: [SIMD3<Float>(0, 0, 0.4)])
+        let gpuSolver = try #require(AVBDGPUSolver(device: device, scene: scene))
+        gpuSolver.dt = 1.0 / 120.0
+        gpuSolver.gravity = -9.8
+        gpuSolver.iterations = 1
+        gpuSolver.enablePrimitiveMeshCollisions = false
+        gpuSolver.enableMeshMeshCollisions = true
+
+        let collisionMeshes = makeMeshOnlyCollisionMeshes(dynamicBodies: scene.bodies)
+        gpuSolver.setCollisionMeshes(collisionMeshes)
+
+        let instanceBuffer = try makeInstanceBuffer(device: device, bodyCount: scene.bodies.count)
+        try runStep(gpuSolver: gpuSolver, queue: queue, instanceBuffer: instanceBuffer)
+
+        let entries = gpuSolver.readMeshMeshIsoVoxelDebugEntries()
+        #expect(!entries.isEmpty)
+        #expect(entries.contains { $0.emittedContactCount > 0 })
+        #expect(entries.allSatisfy { $0.emittedContactCount <= 4 })
+    }
+
     private func runStep(
         gpuSolver: AVBDGPUSolver,
         queue: MTLCommandQueue,
@@ -123,6 +291,53 @@ struct MetalAVBDTests {
         commandBuffer.waitUntilCompleted()
         #expect(commandBuffer.status == .completed)
         #expect(commandBuffer.error == nil)
+    }
+
+    private func runMeshOnlySimulation(
+        gpuSolver: AVBDGPUSolver,
+        queue: MTLCommandQueue,
+        instanceBuffer: MTLBuffer,
+        initialDynamicBodies: [AVBDRigidBody],
+        stepCount: Int
+    ) throws -> MeshOnlySimulationResult {
+        var collisionMeshes = makeMeshOnlyCollisionMeshes(dynamicBodies: initialDynamicBodies)
+        gpuSolver.setCollisionMeshes(collisionMeshes)
+
+        let initialXY = initialDynamicBodies.map { SIMD2<Float>($0.position.x, $0.position.y) }
+        var maxLateralDrift: Float = 0
+        var minVerticalGap = Float.greatestFiniteMagnitude
+        var finalBodies: [AVBDGPUBody] = []
+
+        for _ in 0..<stepCount {
+            try runStep(gpuSolver: gpuSolver, queue: queue, instanceBuffer: instanceBuffer)
+            finalBodies = gpuSolver.readBodies()
+
+            for (bodyIndex, body) in finalBodies.enumerated() {
+                let xy = SIMD2<Float>(body.positionLin.x, body.positionLin.y)
+                maxLateralDrift = max(maxLateralDrift, simd_length(xy - initialXY[bodyIndex]))
+            }
+
+            if finalBodies.count >= 2 {
+                let orderedBodies = finalBodies.sorted { $0.positionLin.z < $1.positionLin.z }
+                for pairIndex in 0..<(orderedBodies.count - 1) {
+                    let gap = orderedBodies[pairIndex + 1].positionLin.z - orderedBodies[pairIndex].positionLin.z
+                    minVerticalGap = min(minVerticalGap, gap)
+                }
+            }
+
+            collisionMeshes = makeMeshOnlyCollisionMeshes(dynamicBodies: finalBodies)
+            #expect(gpuSolver.updateCollisionMeshInstances(collisionMeshes))
+        }
+
+        if minVerticalGap == Float.greatestFiniteMagnitude {
+            minVerticalGap = 0
+        }
+
+        return MeshOnlySimulationResult(
+            finalBodies: finalBodies,
+            maxLateralDrift: maxLateralDrift,
+            minVerticalGap: minVerticalGap
+        )
     }
 
     private func makeInstanceBuffer(device: MTLDevice, bodyCount: Int) throws -> MTLBuffer {
@@ -194,7 +409,111 @@ struct MetalAVBDTests {
         )
     }
 
-    private func makeUnitCubeCollisionMesh() -> AVBDCollisionMeshBroadphaseMesh {
+    private func makeMeshOnlyScene(dynamicBodyPositions: [SIMD3<Float>]) -> AVBDScene {
+        let bodies = dynamicBodyPositions.map { position in
+            AVBDRigidBody(
+                renderShape: .box,
+                size: SIMD3<Float>(1, 1, 1),
+                density: 1.0,
+                friction: 0.8,
+                position: position,
+                orientation: simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1)),
+                velocity: .zero,
+                renderColor: nil,
+                colorGroup: nil
+            )
+        }
+
+        var constraints: [AVBDConstraint] = []
+        if bodies.count >= 2 {
+            for lower in 0..<(bodies.count - 1) {
+                for upper in (lower + 1)..<bodies.count {
+                    constraints.append(.ignoreCollision(bodyA: lower, bodyB: upper))
+                }
+            }
+        }
+
+        return AVBDScene(
+            id: .empty,
+            name: "Mesh Only",
+            bodies: bodies,
+            constraints: constraints
+        )
+    }
+
+    private func makeMeshOnlyCollisionMeshes(dynamicBodies: [AVBDRigidBody]) -> [AVBDCollisionMeshBroadphaseMesh] {
+        var meshes: [AVBDCollisionMeshBroadphaseMesh] = []
+        meshes.reserveCapacity(dynamicBodies.count + 1)
+        meshes.append(
+            makeUnitCubeCollisionMesh(
+                sdfResourceID: "test-floor",
+                ownerBodyIndex: -1,
+                transform: simd_mul(
+                    matrix4x4_translation(0, 0, -0.5),
+                    matrix4x4_scale(6.0, 6.0, 1.0)
+                )
+            )
+        )
+
+        for (bodyIndex, body) in dynamicBodies.enumerated() {
+            let transform = simd_mul(
+                matrix4x4_translation(body.position.x, body.position.y, body.position.z),
+                simd_mul(
+                    matrix4x4_rotation(quaternion: body.orientation),
+                    matrix4x4_scale(body.size.x, body.size.y, body.size.z)
+                )
+            )
+            meshes.append(
+                makeUnitCubeCollisionMesh(
+                    sdfResourceID: "test-cube-body-\(bodyIndex)",
+                    ownerBodyIndex: bodyIndex,
+                    transform: transform
+                )
+            )
+        }
+
+        return meshes
+    }
+
+    private func makeMeshOnlyCollisionMeshes(dynamicBodies: [AVBDGPUBody]) -> [AVBDCollisionMeshBroadphaseMesh] {
+        var meshes: [AVBDCollisionMeshBroadphaseMesh] = []
+        meshes.reserveCapacity(dynamicBodies.count + 1)
+        meshes.append(
+            makeUnitCubeCollisionMesh(
+                sdfResourceID: "test-floor",
+                ownerBodyIndex: -1,
+                transform: simd_mul(
+                    matrix4x4_translation(0, 0, -0.5),
+                    matrix4x4_scale(6.0, 6.0, 1.0)
+                )
+            )
+        )
+
+        for (bodyIndex, body) in dynamicBodies.enumerated() {
+            let transform = simd_mul(
+                matrix4x4_translation(body.positionLin.x, body.positionLin.y, body.positionLin.z),
+                simd_mul(
+                    matrix4x4_rotation(quaternion: simd_quatf(vector: body.positionAng)),
+                    matrix4x4_scale(body.size.x, body.size.y, body.size.z)
+                )
+            )
+            meshes.append(
+                makeUnitCubeCollisionMesh(
+                    sdfResourceID: "test-cube-body-\(bodyIndex)",
+                    ownerBodyIndex: bodyIndex,
+                    transform: transform
+                )
+            )
+        }
+
+        return meshes
+    }
+
+    private func makeUnitCubeCollisionMesh(
+        sdfResourceID: String = "test-cube",
+        ownerBodyIndex: Int = -1,
+        transform: simd_float4x4 = matrix_identity_float4x4
+    ) -> AVBDCollisionMeshBroadphaseMesh {
         let halfExtent: Float = 0.5
         let positions: [SIMD3<Float>] = [
             SIMD3<Float>(-halfExtent, -halfExtent, -halfExtent),
@@ -216,11 +535,11 @@ struct MetalAVBDTests {
         ]
 
         return AVBDCollisionMeshBroadphaseMesh(
-            sdfResourceID: "test-cube",
-            ownerBodyIndex: -1,
+            sdfResourceID: sdfResourceID,
+            ownerBodyIndex: ownerBodyIndex,
             localBoundsMin: SIMD3<Float>(repeating: -halfExtent),
             localBoundsMax: SIMD3<Float>(repeating: halfExtent),
-            transform: matrix_identity_float4x4,
+            transform: transform,
             positions: positions,
             indices: indices
         )
@@ -233,6 +552,12 @@ struct MetalAVBDTests {
     private func expectNearlyEqual(_ lhs: SIMD4<Float>, _ rhs: SIMD4<Float>, tolerance: Float) {
         #expect(simd_length(lhs - rhs) <= tolerance)
     }
+}
+
+fileprivate struct MeshOnlySimulationResult {
+    var finalBodies: [AVBDGPUBody]
+    var maxLateralDrift: Float
+    var minVerticalGap: Float
 }
 
 fileprivate struct CollisionMeshSDFDebugComparisonStats {

@@ -350,6 +350,57 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         slider.maximumValue = 4.0
         return slider
     }()
+    // Hydroelastic controls
+    private let hydroelasticContainerView: UIView = {
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.backgroundColor = UIColor(white: 0.08, alpha: 0.82)
+        view.layer.cornerRadius = 8.0
+        return view
+    }()
+    private let isoVoxelSamplesLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        return label
+    }()
+    private let isoVoxelSamplesSlider: UISlider = {
+        let slider = UISlider()
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.minimumValue = 8
+        slider.maximumValue = 1024
+        return slider
+    }()
+    private let interiorWeightLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        return label
+    }()
+    private let interiorWeightSlider: UISlider = {
+        let slider = UISlider()
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.minimumValue = 0.0
+        slider.maximumValue = 1.0
+        return slider
+    }()
+    private let reduceContactsLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = "Reduce Contacts"
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        return label
+    }()
+    private let reduceContactsSwitch: UISwitch = {
+        let toggle = UISwitch()
+        toggle.translatesAutoresizingMaskIntoConstraints = false
+        toggle.onTintColor = UIColor.systemGreen
+        toggle.isOn = true
+        return toggle
+    }()
     private let statsContainerView: UIView = {
         let view = UIView()
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -714,6 +765,17 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         angularDampingContainerView.addSubview(angularDampingSlider)
         angularDampingSlider.addTarget(self, action: #selector(angularDampingChanged(_:)), for: .valueChanged)
 
+        view.addSubview(hydroelasticContainerView)
+        hydroelasticContainerView.addSubview(isoVoxelSamplesLabel)
+        hydroelasticContainerView.addSubview(isoVoxelSamplesSlider)
+        isoVoxelSamplesSlider.addTarget(self, action: #selector(isoVoxelSamplesChanged(_:)), for: .valueChanged)
+        hydroelasticContainerView.addSubview(interiorWeightLabel)
+        hydroelasticContainerView.addSubview(interiorWeightSlider)
+        interiorWeightSlider.addTarget(self, action: #selector(interiorWeightChanged(_:)), for: .valueChanged)
+        hydroelasticContainerView.addSubview(reduceContactsLabel)
+        hydroelasticContainerView.addSubview(reduceContactsSwitch)
+        reduceContactsSwitch.addTarget(self, action: #selector(reduceContactsChanged(_:)), for: .valueChanged)
+
         NSLayoutConstraint.activate([
             simulationStepDeltaContainerView.topAnchor.constraint(equalTo: gpuOptionsStackView.bottomAnchor, constant: 12),
             simulationStepDeltaContainerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
@@ -766,7 +828,6 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             angularDampingContainerView.topAnchor.constraint(equalTo: linearDampingContainerView.bottomAnchor, constant: 12),
             angularDampingContainerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             angularDampingContainerView.widthAnchor.constraint(equalToConstant: 240),
-            angularDampingContainerView.bottomAnchor.constraint(lessThanOrEqualTo: statsContainerView.topAnchor, constant: -12),
 
             angularDampingLabel.topAnchor.constraint(equalTo: angularDampingContainerView.topAnchor, constant: 8),
             angularDampingLabel.leadingAnchor.constraint(equalTo: angularDampingContainerView.leadingAnchor, constant: 12),
@@ -774,7 +835,33 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
             angularDampingSlider.topAnchor.constraint(equalTo: angularDampingLabel.bottomAnchor, constant: 6),
             angularDampingSlider.leadingAnchor.constraint(equalTo: angularDampingContainerView.leadingAnchor, constant: 12),
             angularDampingSlider.trailingAnchor.constraint(equalTo: angularDampingContainerView.trailingAnchor, constant: -12),
-            angularDampingSlider.bottomAnchor.constraint(equalTo: angularDampingContainerView.bottomAnchor, constant: -8)
+            angularDampingSlider.bottomAnchor.constraint(equalTo: angularDampingContainerView.bottomAnchor, constant: -8),
+
+            // Hydroelastic controls
+            hydroelasticContainerView.topAnchor.constraint(equalTo: angularDampingContainerView.bottomAnchor, constant: 12),
+            hydroelasticContainerView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            hydroelasticContainerView.widthAnchor.constraint(equalToConstant: 240),
+            hydroelasticContainerView.bottomAnchor.constraint(lessThanOrEqualTo: statsContainerView.topAnchor, constant: -12),
+
+            isoVoxelSamplesLabel.topAnchor.constraint(equalTo: hydroelasticContainerView.topAnchor, constant: 8),
+            isoVoxelSamplesLabel.leadingAnchor.constraint(equalTo: hydroelasticContainerView.leadingAnchor, constant: 12),
+            isoVoxelSamplesLabel.trailingAnchor.constraint(equalTo: hydroelasticContainerView.trailingAnchor, constant: -12),
+            isoVoxelSamplesSlider.topAnchor.constraint(equalTo: isoVoxelSamplesLabel.bottomAnchor, constant: 6),
+            isoVoxelSamplesSlider.leadingAnchor.constraint(equalTo: hydroelasticContainerView.leadingAnchor, constant: 12),
+            isoVoxelSamplesSlider.trailingAnchor.constraint(equalTo: hydroelasticContainerView.trailingAnchor, constant: -12),
+
+            interiorWeightLabel.topAnchor.constraint(equalTo: isoVoxelSamplesSlider.bottomAnchor, constant: 10),
+            interiorWeightLabel.leadingAnchor.constraint(equalTo: hydroelasticContainerView.leadingAnchor, constant: 12),
+            interiorWeightLabel.trailingAnchor.constraint(equalTo: hydroelasticContainerView.trailingAnchor, constant: -12),
+            interiorWeightSlider.topAnchor.constraint(equalTo: interiorWeightLabel.bottomAnchor, constant: 6),
+            interiorWeightSlider.leadingAnchor.constraint(equalTo: hydroelasticContainerView.leadingAnchor, constant: 12),
+            interiorWeightSlider.trailingAnchor.constraint(equalTo: hydroelasticContainerView.trailingAnchor, constant: -12),
+
+            reduceContactsLabel.topAnchor.constraint(equalTo: interiorWeightSlider.bottomAnchor, constant: 10),
+            reduceContactsLabel.leadingAnchor.constraint(equalTo: hydroelasticContainerView.leadingAnchor, constant: 12),
+            reduceContactsSwitch.centerYAnchor.constraint(equalTo: reduceContactsLabel.centerYAnchor),
+            reduceContactsSwitch.trailingAnchor.constraint(equalTo: hydroelasticContainerView.trailingAnchor, constant: -12),
+            reduceContactsSwitch.bottomAnchor.constraint(equalTo: hydroelasticContainerView.bottomAnchor, constant: -8),
         ])
 
         updateSimulationParameterControls()
@@ -903,6 +990,11 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         simulationStepsPerFrameLabel.text = "Steps / frame: \(renderer.currentSimulationStepsPerFrame)"
         linearDampingLabel.text = String(format: "Linear Damping: %.2f", renderer.currentLinearDamping)
         angularDampingLabel.text = String(format: "Angular Damping: %.2f", renderer.currentAngularDamping)
+        isoVoxelSamplesSlider.value = Float(renderer.currentMeshMeshMaxIsoVoxelSamples)
+        isoVoxelSamplesLabel.text = "Iso Voxel Samples: \(renderer.currentMeshMeshMaxIsoVoxelSamples)"
+        interiorWeightSlider.value = renderer.currentHydroelasticInteriorWeight
+        interiorWeightLabel.text = String(format: "Interior Weight: %.2f", renderer.currentHydroelasticInteriorWeight)
+        reduceContactsSwitch.isOn = renderer.currentMeshMeshReduceContacts
     }
 
     @objc private func simulationModeChanged(_ sender: UISegmentedControl) {
@@ -945,6 +1037,26 @@ class GameViewController: UIViewController, UIGestureRecognizerDelegate {
         sender.value = damping
         renderer.setAngularDamping(damping)
         updateSimulationParameterControls()
+    }
+
+    @objc private func isoVoxelSamplesChanged(_ sender: UISlider) {
+        let samples = Int(sender.value.rounded())
+        // Snap to powers of 2 for nicer values: 8, 16, 32, 64, 128, 256, 512, 1024
+        let po2 = max(8, min(1 << Int(log2(Float(samples)).rounded()), 1024))
+        sender.value = Float(po2)
+        renderer.setMeshMeshMaxIsoVoxelSamples(po2)
+        updateSimulationParameterControls()
+    }
+
+    @objc private func interiorWeightChanged(_ sender: UISlider) {
+        let weight = round(sender.value * 20.0) / 20.0
+        sender.value = weight
+        renderer.setHydroelasticInteriorWeight(weight)
+        updateSimulationParameterControls()
+    }
+
+    @objc private func reduceContactsChanged(_ sender: UISwitch) {
+        renderer.setMeshMeshReduceContacts(sender.isOn)
     }
 
     @objc private func broadphaseRefreshChanged(_ sender: UISlider) {
